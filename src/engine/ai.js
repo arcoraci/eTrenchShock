@@ -20,6 +20,7 @@ import {
 import { remaining, hasShock, naturalFaces, unusedDice } from "./dice.js";
 import { eventNeeds, bayonetDestinations } from "./events.js";
 import { tanksReadyToMove } from "./game.js";
+import { preferredMissionAction } from "./missions.js";
 
 const HOSTILE = new Set(["Bayonet Charge", "Bombing Run", "Heavy Barrage", "Sniper", "Trench Fever"]);
 
@@ -40,6 +41,7 @@ export function chooseAiAction(state) {
   }
   if (pending.type === "gambit") return { type: "FINISH_GAMBIT" };
   if (pending.type === "allocate-hits") return { type: "ALLOCATE_HITS", auto: true };
+  if (pending.type === "pick-mission") return preferredMissionAction(state);
   if (state.phase === "reroll") return aiReroll(state, state.active);
   if (state.phase === "action") return aiAction(state, state.active);
   if (state.phase === "regroup") return aiRegroup(state, state.active);

@@ -1,4 +1,4 @@
-import { FORMATS, uid, shuffle, resetIds, refreshControl, log, ownTrench } from "./core.js";
+import { FORMATS, uid, shuffle, resetIds, refreshControl, log, ownTrench, ownZone1, sideZones, ZONE_LABELS } from "./core.js";
 import { createMatchId } from "../export/ledger.js";
 
 export function emptyPlayer(side) {
@@ -89,15 +89,23 @@ function buildCover(state) {
   state.coverSupply = shuffle(state, tokens);
 }
 
-function placeStartingCover(state) {
+function resolveCoverZone(side, requested) {
+  if (requested == null || requested === "") return ownZone1(side);
+  if (!sideZones(side).includes(requested)) {
+    throw new Error("Starting cover must be placed in one of your zones.");
+  }
+  return requested;
+}
+
+function placeStartingCover(state, coverZones = {}) {
   for (const side of ["uk", "de"]) {
     const token = state.coverSupply.shift();
-    const zone = side === "uk" ? "uk1" : "de1";
+    if (!token) break;
+    const zone = resolveCoverZone(side, coverZones[side]);
     token.loc = zone;
     state.covers.push(token);
     const who = side === "uk" ? "Britain" : "Germany";
-    const label = zone === "uk1" ? "British Zone 1" : "German Zone 1";
-    log(state, `${who} places starting Cover in ${label}.`);
+    log(state, `${who} places starting Cover in ${ZONE_LABELS[zone]}.`);
   }
 }
 
@@ -161,6 +169,7 @@ export function beginInitiative(state) {
   state.initiative = null;
   state.effects = emptyEffects();
   state.regroupDone = { uk: false, de: false };
+  state.roundMissions = { uk: false, de: false };
   for (const side of ["uk", "de"]) {
     const p = state.players[side];
     p.dice = [];
@@ -252,7 +261,7 @@ export function createGame(events, missions, options = {}) {
   buildCover(state);
   buildEvents(state, events);
   buildMissions(state, missions, spec);
-  placeStartingCover(state);
+  placeStartingCover(state, options.coverZones || {});
   refreshControl(state);
   const who = human === "uk" ? "Britain" : "Germany";
   if (mode === "hotseat") {

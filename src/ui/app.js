@@ -80,12 +80,16 @@ let killQueue = [];
 let killTimer = 0;
 let killSerial = 0;
 let setup = { format: "standard", human: "uk", mode: "solo", undo: "off" };
+let coverAsk = null;
 let ui = freshUi();
 const SAVE_KEY = "trench-shock-battle";
 let menuOpen = false;
 let paused = false;
 let menuNote = "";
 let menuConfirm = null;
+let menuLink = "";
+let updateBusy = false;
+const UPDATE_PAGE = "https://github.com/arcoraci/eTrenchShock";
 let savedStamp = null;
 let leaveAsk = null;
 let stepReturn = null;
@@ -125,7 +129,7 @@ function esc(value) {
 
 function actorSide() {
   if (!state) return null;
-  if (state.pending?.type === "generals-order" || state.pending?.type === "spotter" || state.pending?.type === "mortar-target" || state.pending?.type === "gambit") {
+  if (state.pending?.type === "generals-order" || state.pending?.type === "spotter" || state.pending?.type === "mortar-target" || state.pending?.type === "gambit" || state.pending?.type === "pick-mission") {
     return state.pending.side;
   }
   if (state.phase === "reroll" || state.phase === "action" || state.phase === "regroup") return state.active;
@@ -1093,6 +1097,9 @@ function promptText() {
     const base = `Hits remaining: ${remain}. The attack on ${place} rolled ${pending.hits} hit${pending.hits === 1 ? "" : "s"}. Click a target to assign a hit. Click that target again to take the hit off.`;
     return coverLine ? `${coverLine} ${base}` : base;
   }
+  if (state.pending?.type === "pick-mission") {
+    return "More than one mission is ready. Complete one this round. The others stay in hand and can score in a later round.";
+  }
   if (state.pending?.type === "gambit" && state.pending.stage === "keep") {
     return "Mission Gambit: keep one of these two Missions. The other goes to the bottom of the deck. Your five dice stay available.";
   }
@@ -1154,6 +1161,7 @@ function promptText() {
 function phaseTitle() {
   const me = viewer();
   if (state.phase === "end") return "Battle over";
+  if (state.pending?.type === "pick-mission") return `${labelSide(me)} · Choose a mission`;
   if (state.pending?.type === "generals-order") return `${labelSide(me)} · General's Order`;
   if (state.pending?.type === "spotter") return `${labelSide(me)} · Spotter`;
   if (state.pending?.type === "gambit") return `${labelSide(me)} · Mission Gambit`;
@@ -1251,6 +1259,20 @@ function actionList() {
     }));
   }
   if (state.pending?.type === "allocate-hits") return hitAllocationButtons();
+  if (state.pending?.type === "pick-mission") {
+    const pending = state.pending;
+    const hand = state.players[pending.side].missionHand;
+    return pending.insts.map((inst) => {
+      const card = hand.find((mission) => mission.inst === inst);
+      if (!card) return null;
+      return {
+        label: `Complete ${card.title} (+${card.vp} VP)`,
+        hint: cardBlurb(card),
+        primary: true,
+        run: () => commit({ type: "PICK_MISSION", inst: card.inst }),
+      };
+    }).filter(Boolean);
+  }
   if (state.pending?.type === "gambit" && state.pending.stage === "keep") {
     return state.pending.cards.map((card) => ({
       label: `Keep ${card.title} (${card.vp} VP)`,
@@ -2147,7 +2169,7 @@ function saveRecord() {
 
 function actingSide(game) {
   const pending = game?.pending;
-  if (pending?.type === "generals-order" || pending?.type === "spotter" || pending?.type === "mortar-target" || pending?.type === "gambit") {
+  if (pending?.type === "generals-order" || pending?.type === "spotter" || pending?.type === "mortar-target" || pending?.type === "gambit" || pending?.type === "pick-mission") {
     return pending.side;
   }
   if (game?.phase === "reroll" || game?.phase === "action" || game?.phase === "regroup") return game.active;
@@ -2157,6 +2179,7 @@ function actingSide(game) {
 function stepName(game) {
   if (!game) return "Battle";
   if (game.phase === "end") return "Battle over";
+  if (game.pending?.type === "pick-mission") return "Choose a mission";
   if (game.pending?.type === "generals-order") return "General's Order";
   if (game.pending?.type === "spotter") return "Spotter";
   if (game.pending?.type === "gambit") return "Mission Gambit";
@@ -2210,6 +2233,7 @@ function leaveToSetup() {
   clearMissionCelebration();
   clearEmptyTimer();
   state = null;
+  coverAsk = null;
   history = [];
   leaveAsk = null;
   stepReturn = null;
@@ -2307,6 +2331,17 @@ function confirmCopy() {
       kind: "menu-new-yes",
     };
   }
+  if (menuConfirm === "update") {
+    const unfinished = state && state.phase !== "end";
+    return {
+      title: "Update this game?",
+      body: unfinished
+        ? "A newer version is available. An unfinished battle in this browser will still be there only if you saved it. A reload does not wipe localStorage saves, but it does leave the current on-screen battle."
+        : "A newer version is available. Reload the page after the update downloads.",
+      yes: "Update",
+      kind: "menu-update-yes",
+    };
+  }
   return {
     title: "Delete the saved battle?",
     body: "This removes it from this device. The battle on the table stays.",
@@ -2379,11 +2414,136 @@ function downloadBalance() {
   render();
 }
 
+function showZipUpdate(reason) {
+  menuConfirm = null;
+  menuLink = UPDATE_PAGE;
+  menuNote = `${reason} Download the latest ZIP:`;
+}
+
+function showUpdateStatus(data) {
+  menuLink = "";
+  menuConfirm = null;
+  if (data.git === false) {
+    showZipUpdate("Git is missing, so this copy cannot update itself.");
+    return;
+  }
+  if (data.clone === false) {
+    showZipUpdate("This copy is not a git clone, so it cannot update itself.");
+    return;
+  }
+  if (data.conflict) {
+    menuNote = "This copy has a merge conflict. Update was not run.";
+    return;
+  }
+  if (data.behind) {
+    menuConfirm = "update";
+    menuNote = "";
+    return;
+  }
+  if (data.upToDate) {
+    menuNote = "The game is already the latest.";
+    return;
+  }
+  menuNote = data.message || "Could not check for an update.";
+}
+
+async function checkForUpdate() {
+  if (updateBusy) return;
+  updateBusy = true;
+  menuOpen = true;
+  menuConfirm = null;
+  menuLink = "";
+  menuNote = "Checking for an update…";
+  render();
+  try {
+    let response;
+    try {
+      response = await fetch("/local-update/status", {
+        cache: "no-store",
+        headers: { "X-Trench-Local": "1" },
+      });
+    } catch {
+      menuNote = "Close the server and start again with start.bat (Windows) so Update can run.";
+      return;
+    }
+    if (response.status === 404) {
+      menuNote = "Close the server and start again with start.bat (Windows) so Update can run.";
+      return;
+    }
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (!data || typeof data !== "object") {
+      menuNote = "Could not check for an update.";
+      return;
+    }
+    showUpdateStatus(data);
+  } finally {
+    updateBusy = false;
+    menuOpen = true;
+    render();
+  }
+}
+
+async function runGameUpdate() {
+  if (updateBusy) return;
+  updateBusy = true;
+  menuOpen = true;
+  menuConfirm = null;
+  menuLink = "";
+  menuNote = "Updating the game…";
+  const unfinished = Boolean(state && state.phase !== "end");
+  render();
+  try {
+    let response;
+    try {
+      response = await fetch("/local-update/pull", {
+        method: "POST",
+        headers: { "X-Trench-Local": "1" },
+      });
+    } catch {
+      menuNote = "Close the server and start again with start.bat (Windows) so Update can run.";
+      return;
+    }
+    if (response.status === 404) {
+      menuNote = "Close the server and start again with start.bat (Windows) so Update can run.";
+      return;
+    }
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (!data || data.ok === false) {
+      if (data && data.git === false) showZipUpdate("Git is missing, so this copy cannot update itself.");
+      else if (data && data.clone === false) showZipUpdate("This copy is not a git clone, so it cannot update itself.");
+      else menuNote = (data && data.message) || "The update failed.";
+      return;
+    }
+    if (data.updated === false) {
+      menuNote = "The game is already the latest.";
+      return;
+    }
+    menuNote = unfinished
+      ? "The update is downloaded. Reload this page to play it. An unfinished battle in this browser will still be there only if you saved it. A reload does not wipe localStorage saves, but it does leave the current on-screen battle."
+      : "The update is downloaded. Reload this page to play it.";
+  } finally {
+    updateBusy = false;
+    menuOpen = true;
+    render();
+  }
+}
+
 function menuActionsHtml(record) {
   const load = `<button type="button" data-click="menu-load"${record ? "" : " disabled"}>Load</button>`;
   const drop = `<button type="button" data-click="menu-delete"${record ? "" : " disabled"}>Delete save</button>`;
   const excel = `<button type="button" data-click="export-excel">Export to Excel</button>`;
-  if (!state) return `${load}${drop}${excel}`;
+  const update = `<button type="button" data-click="menu-update"${updateBusy ? " disabled" : ""}>Update game</button>`;
+  if (!state) return `${load}${drop}${excel}${update}`;
   return `<button type="button" class="primary" data-click="menu-resume">Resume</button>
     <button type="button" data-click="menu-pause"${paused ? " disabled" : ""}>Pause</button>
     <button type="button" data-click="menu-save">Save</button>
@@ -2391,7 +2551,8 @@ function menuActionsHtml(record) {
     ${load}
     <button type="button" data-click="menu-new">New game</button>
     <button type="button" data-click="menu-quit">Quit</button>
-    ${drop}`;
+    ${drop}
+    ${update}`;
 }
 
 function menuPanelHtml() {
@@ -2401,7 +2562,8 @@ function menuPanelHtml() {
     ? `<p class="menu-ask">${esc(ask.title)}</p><p class="menu-note">${esc(ask.body)}</p><button type="button" class="primary" data-click="${ask.kind}">${esc(ask.yes)}</button><button type="button" data-click="menu-cancel">Cancel</button>`
     : menuActionsHtml(record);
   const note = menuNote ? `<p class="menu-note">${esc(menuNote)}</p>` : "";
-  return `<div class="game-menu" id="game-menu" role="dialog" aria-label="Menu"><h2>Menu</h2>${body}<p class="menu-status">${esc(record ? saveSummary(record) : "No saved battle.")}</p>${note}</div>`;
+  const link = menuLink ? `<p class="menu-note"><a href="${esc(menuLink)}">${esc(menuLink)}</a></p>` : "";
+  return `<div class="game-menu" id="game-menu" role="dialog" aria-label="Menu"><h2>Menu</h2>${body}<p class="menu-status">${esc(record ? saveSummary(record) : "No saved battle.")}</p>${note}${link}</div>`;
 }
 
 function menuChrome() {
@@ -2415,14 +2577,26 @@ function menuChrome() {
 
 function handleMenu(kind) {
   if (kind === "pause-hold") return true;
+  if (kind !== "menu-update" && kind !== "menu-update-yes") menuLink = "";
   if (kind === "export-excel") {
     downloadBalance();
+    return true;
+  }
+  if (kind === "menu-update") {
+    checkForUpdate();
+    return true;
+  }
+  if (kind === "menu-update-yes") {
+    runGameUpdate();
     return true;
   }
   if (kind === "menu") {
     menuOpen = !menuOpen;
     if (!menuOpen) menuConfirm = null;
-    if (menuOpen) menuNote = "";
+    if (menuOpen) {
+      menuNote = "";
+      menuLink = "";
+    }
     render();
     return true;
   }
@@ -2616,7 +2790,7 @@ function render() {
   const mapLeft = map?.scrollLeft || 0;
   const sideTop = side?.scrollTop || 0;
   if (!state) {
-    root.innerHTML = `${menuChrome()}${splashHtml()}`;
+    root.innerHTML = `${menuChrome()}${coverAsk ? coverPlaceHtml() : splashHtml()}`;
     return;
   }
   const me = viewer();
@@ -2706,7 +2880,9 @@ function formatName() {
 
 function veilHtml() {
   if (state.mode !== "hotseat" || state.phase === "end" || ui.acked === actorSide() || !actorSide()) return "";
-  const step = state.pending?.type === "generals-order"
+  const step = state.pending?.type === "pick-mission"
+    ? "Choose a mission"
+    : state.pending?.type === "generals-order"
     ? "General's Order"
     : state.phase === "action"
       ? STEPS.find(([id]) => id === state.actionStep)?.[1] || "Action"
@@ -2733,6 +2909,8 @@ function helpHtml() {
       <li>The loser of initiative sets their dice first. Each side may take Roll 2 and Roll 3. On each of those rolls, any number of dice may be rerolled, including dice kept earlier. Then the winner of initiative acts through all seven steps before the loser.</li>
       <li>On your turn: Shock, tank movement, events, deployment, movement, cover, then attacks. Empty steps are skipped.</li>
       <li>At regroup, the side that eliminated more soldiers scores 1 VP. Each side may exchange up to two unused dice for soldiers in the trench, then draws one event. After rounds 3, 6, and 9, each side also draws a mission.</li>
+      <li>Before the first round, each side places one cover token in Zone 1, Zone 2, or Zone 3 on its own side. Headquarters places its cover in Zone 1.</li>
+      <li>A side completes at most one mission each round. If more than one is ready, that commander chooses which one scores. The others stay incomplete.</li>
     </ul>
     <h3>Dice</h3>
     <ul>
@@ -2771,6 +2949,52 @@ function splashHtml() {
     <button type="button" class="ghost" data-click="help" style="margin-left:8px">How to play</button>
     ${ui.help ? helpHtml() : ""}
   </div></div>`;
+}
+
+function coverPlaceHtml() {
+  const side = coverAsk?.side === "de" ? "de" : "uk";
+  const zones = sideZones(side);
+  const names = zones.map((zone) => ZONE_LABELS[zone]);
+  const choices = zones.map((zone) => `<button type="button" class="choice" data-click="cover-zone" data-zone="${zone}">${esc(ZONE_LABELS[zone])}</button>`).join("");
+  const hq = setup.mode === "hotseat" ? "" : `<p class="note">Headquarters places its own cover in Zone 1.</p>`;
+  return `<div class="splash"><div class="splash-card">
+    <div class="portraits"><div class="badge uk">${helmet("uk")}</div><div class="badge de">${helmet("de")}</div></div>
+    <h1>Starting cover</h1>
+    <p class="lede">${esc(labelSide(side))}: place your starting cover in ${esc(names[0])}, ${esc(names[1])}, or ${esc(names[2])}.</p>
+    <div class="choices">${choices}</div>
+    ${hq}
+    <button type="button" class="ghost" data-click="cover-back">Back</button>
+    <button type="button" class="ghost" data-click="help" style="margin-left:8px">How to play</button>
+    ${ui.help ? helpHtml() : ""}
+  </div></div>`;
+}
+
+function launchBattle(coverZones) {
+  clearMissionCelebration();
+  clearEmptyTimer();
+  ui = freshUi();
+  history = [];
+  leaveAsk = null;
+  stepReturn = null;
+  actionUndo = null;
+  attackDraft = null;
+  holdEmpty = null;
+  emptyMemo = null;
+  paused = false;
+  menuOpen = false;
+  menuConfirm = null;
+  menuNote = "";
+  savedStamp = null;
+  coverAsk = null;
+  state = startMatch(catalog.events, catalog.missions, {
+    format: setup.format,
+    human: setup.mode === "hotseat" ? "uk" : setup.human,
+    mode: setup.mode,
+    coverZones,
+  });
+  ensureMatchId(state);
+  noteBattleOutcome(state);
+  render();
 }
 
 function onClick(event) {
@@ -2833,29 +3057,30 @@ function onClick(event) {
     return;
   }
   if (kind === "begin") {
-    clearMissionCelebration();
-    clearEmptyTimer();
-    ui = freshUi();
-    history = [];
-    leaveAsk = null;
-    stepReturn = null;
-    actionUndo = null;
-    attackDraft = null;
-    holdEmpty = null;
-    emptyMemo = null;
-    paused = false;
-    menuOpen = false;
-    menuConfirm = null;
-    menuNote = "";
-    savedStamp = null;
-    state = startMatch(catalog.events, catalog.missions, {
-      format: setup.format,
-      human: setup.mode === "hotseat" ? "uk" : setup.human,
-      mode: setup.mode,
-    });
-    ensureMatchId(state);
-    noteBattleOutcome(state);
+    coverAsk = { side: setup.mode === "hotseat" ? "uk" : setup.human, uk: null, de: null };
+    ui.help = false;
     render();
+    return;
+  }
+  if (kind === "cover-back") {
+    coverAsk = null;
+    render();
+    return;
+  }
+  if (kind === "cover-zone" && coverAsk) {
+    const zone = el.dataset.zone;
+    const side = coverAsk.side === "de" ? "de" : "uk";
+    if (!sideZones(side).includes(zone)) return;
+    coverAsk[side] = zone;
+    if (setup.mode === "hotseat" && side === "uk") {
+      coverAsk.side = "de";
+      render();
+      return;
+    }
+    const coverZones = setup.mode === "hotseat"
+      ? { uk: coverAsk.uk, de: coverAsk.de }
+      : { [setup.human]: zone };
+    launchBattle(coverZones);
     return;
   }
   if (!state) return;

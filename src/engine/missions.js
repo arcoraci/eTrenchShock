@@ -16,14 +16,76 @@ export function trimMissions(state, side) {
   while (hand.length > 5) state.missionDeck.push(hand.pop());
 }
 
-export function checkMissions(state, side, ctx = {}) {
-  const hand = state.players[side].missionHand.slice();
-  for (const mission of hand) {
-    if (isComplete(state, side, mission, ctx)) completeMission(state, side, mission);
+function missionTaken(state, side) {
+  return Boolean(state.roundMissions && state.roundMissions[side]);
+}
+
+function sideChooses(state, side) {
+  if (!state || state.mode === "sim") return false;
+  if (state.mode === "hotseat") return true;
+  return side === state.human;
+}
+
+function highestMission(ready) {
+  let best = ready[0];
+  for (const mission of ready) {
+    if (mission.vp > best.vp) best = mission;
   }
+  return best;
+}
+
+export function checkMissions(state, side, ctx = {}) {
+  if (state.pending?.type === "pick-mission") return "choose";
+  if (missionTaken(state, side)) return "none";
+  const hand = state.players[side].missionHand.slice();
+  const ready = hand.filter((mission) => isComplete(state, side, mission, ctx));
+  if (!ready.length) return "none";
+  if (ready.length > 1 && sideChooses(state, side)) {
+    state.pending = {
+      type: "pick-mission",
+      side,
+      insts: ready.map((mission) => mission.inst),
+      ctx: { timing: ctx.timing || null },
+      after: null,
+    };
+    return "choose";
+  }
+  completeMission(state, side, ready.length === 1 ? ready[0] : highestMission(ready));
+  return "done";
+}
+
+export function chooseMission(state, inst) {
+  const pending = state.pending;
+  if (!pending || pending.type !== "pick-mission") throw new Error("No mission choice is waiting.");
+  const side = pending.side;
+  if (missionTaken(state, side)) throw new Error("A mission is already complete this round.");
+  const mission = state.players[side].missionHand.find((card) => card.inst === inst);
+  if (!mission || !(pending.insts || []).includes(mission.inst)) throw new Error("Choose one of those missions.");
+  const ctx = pending.ctx || {};
+  if (!isComplete(state, side, mission, ctx)) throw new Error("That mission is not complete.");
+  const after = pending.after || null;
+  state.pending = null;
+  completeMission(state, side, mission);
+  return after;
+}
+
+export function preferredMissionAction(state) {
+  const pending = state.pending;
+  if (pending?.type !== "pick-mission") return null;
+  const hand = state.players[pending.side]?.missionHand || [];
+  const options = [];
+  for (const inst of pending.insts || []) {
+    const mission = hand.find((card) => card.inst === inst);
+    if (mission) options.push(mission);
+  }
+  if (!options.length) return null;
+  return { type: "PICK_MISSION", inst: highestMission(options).inst };
 }
 
 function completeMission(state, side, mission) {
+  if (!state.roundMissions) state.roundMissions = { uk: false, de: false };
+  if (state.roundMissions[side]) return;
+  state.roundMissions[side] = true;
   state.vp[side] += mission.vp;
   const p = state.players[side];
   p.missionHand = p.missionHand.filter((m) => m.inst !== mission.inst);

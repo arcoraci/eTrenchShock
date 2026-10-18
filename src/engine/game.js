@@ -38,7 +38,7 @@ import {
   canRegroup,
 } from "./dice.js";
 import { playEvent, discardEvent } from "./events.js";
-import { checkMissions, drawMission, trimMissions } from "./missions.js";
+import { checkMissions, chooseMission, drawMission, trimMissions } from "./missions.js";
 import { applyHits, allocationOptions, allocationReady, applyAllocatedHits, eliminateSoldier, revealAttackedCover, takeCoverTrophy } from "./combat.js";
 
 const STEPS = ["shock", "tank", "event", "deploy", "move", "cover", "attack"];
@@ -78,6 +78,9 @@ function handle(state, action) {
   if (state.pending?.type === "allocate-hits" && action.type !== "ALLOCATE_HITS") {
     throw new Error("Assign the hits first.");
   }
+  if (state.pending?.type === "pick-mission" && action.type !== "PICK_MISSION") {
+    throw new Error("Choose one mission to complete.");
+  }
   const handlers = {
     ROLL_1: () => doRoll1(state),
     GENERALS_ORDER: () => doGeneralsOrder(state, action),
@@ -106,6 +109,7 @@ function handle(state, action) {
     ALLOCATE_HITS: () => allocateHits(state, action),
     PICK_GAMBIT: () => pickGambit(state, action),
     FINISH_GAMBIT: () => finishGambit(state, action),
+    PICK_MISSION: () => doPickMission(state, action),
     OVERRUN: () => doOverrun(state, action),
     SKIP_ATTACK: () => finishActionPhase(state),
     REGROUP_DRAW: () => regroupDraw(state, action),
@@ -279,6 +283,82 @@ function finishTankMove(state, tank) {
   advanceStep(state);
 }
 
+function missionPaused(state, after) {
+  if (state.pending?.type !== "pick-mission") return false;
+  if (after && !state.pending.after) state.pending.after = after;
+  return true;
+}
+
+function settlePending(state) {
+  if (state.phase === "end" || state.pending?.type === "pick-mission") return;
+  if (state.phase === "action" && state.actionStep) {
+    state.pending = { type: "action", step: state.actionStep };
+    return;
+  }
+  if (state.phase === "regroup" && state.active) {
+    state.pending = { type: "regroup", side: state.active };
+    return;
+  }
+  if (state.phase === "reroll" && state.active) state.pending = { type: "reroll", side: state.active };
+}
+
+function doPickMission(state, action) {
+  const after = chooseMission(state, action.inst);
+  afterMissionChoice(state, after);
+}
+
+function afterMissionChoice(state, after) {
+  if (state.phase === "end") return;
+  if (!after) {
+    settlePending(state);
+    return;
+  }
+  if (after.kind === "advance-step") {
+    advanceStep(state);
+    return;
+  }
+  if (after.kind === "finish-tank") {
+    const tank = state.equipment.find((unit) => unit.id === after.tankId);
+    if (tank) finishTankMove(state, tank);
+    if (state.phase !== "end" && state.pending?.type !== "action" && state.pending?.type !== "pick-mission") {
+      settlePending(state);
+    }
+    return;
+  }
+  if (after.kind === "gambit-auto") {
+    trimMissions(state, after.side);
+    if (state.missionExhausted) {
+      endGame(state, "Mission Exhaustion");
+      return;
+    }
+    advanceStep(state);
+    return;
+  }
+  if (after.kind === "gambit-swap") {
+    state.pending = { type: "gambit", side: after.side, stage: "swap" };
+    return;
+  }
+  if (after.kind === "scheduled") {
+    trimMissions(state, after.side);
+    if (state.missionExhausted) {
+      endGame(state, "Mission Exhaustion");
+      return;
+    }
+    if (runScheduled(state, after.rest)) return;
+    endRound(state);
+    return;
+  }
+  if (after.kind === "end-de") {
+    if (checkMissions(state, "de", { timing: "end" }) === "choose") {
+      state.pending.after = { kind: "finish-round", briefStart: after.briefStart };
+      return;
+    }
+    finishRound(state, after.briefStart);
+    return;
+  }
+  if (after.kind === "finish-round") finishRound(state, after.briefStart);
+}
+
 function shouldSkipStep(state, side, step) {
   if (step === "shock") return !hasShock(state, side);
   if (step === "tank") return !movableTank(state, side);
@@ -350,6 +430,7 @@ function doShock(state, action) {
     mustardGas(state, state.active);
   } else throw new Error("Choose a Shock option.");
   if (state.phase === "end" || state.pending?.type === "gambit") return;
+  if (missionPaused(state, { kind: "advance-step" })) return;
   advanceStep(state);
 }
 
@@ -371,7 +452,10 @@ function missionGambit(state, side) {
   const keep = drawn.slice().sort((a, b) => b.vp - a.vp)[0];
   state.players[side].missionHand.push(keep);
   for (const card of drawn) if (card !== keep) state.missionDeck.push(card);
-  checkMissions(state, side, { timing: "immediate" });
+  if (checkMissions(state, side, { timing: "immediate" }) === "choose") {
+    state.pending.after = { kind: "gambit-auto", side };
+    return;
+  }
   trimMissions(state, side);
   if (state.missionExhausted) endGame(state, "Mission Exhaustion");
 }
@@ -383,7 +467,10 @@ function pickGambit(state, action) {
   state.players[pending.side].missionHand.push(keep);
   for (const card of pending.cards) if (card !== keep) state.missionDeck.push(card);
   log(state, `${labelSide(pending.side)} keeps ${keep.title}.`);
-  checkMissions(state, pending.side, { timing: "immediate" });
+  if (checkMissions(state, pending.side, { timing: "immediate" }) === "choose") {
+    state.pending.after = { kind: "gambit-swap", side: pending.side };
+    return;
+  }
   state.pending = { type: "gambit", side: pending.side, stage: "swap" };
   if (state.missionExhausted) endGame(state, "Mission Exhaustion");
 }
@@ -409,7 +496,10 @@ function finishGambit(state, action) {
     endGame(state, "Mission Exhaustion");
     return;
   }
-  checkMissions(state, side, { timing: "immediate" });
+  if (checkMissions(state, side, { timing: "immediate" }) === "choose") {
+    state.pending.after = { kind: "advance-step" };
+    return;
+  }
   if (state.missionExhausted) {
     endGame(state, "Mission Exhaustion");
     return;
@@ -474,6 +564,7 @@ function moveTank(state, action) {
       tank.damage = 0;
       refreshControl(state, { tankLeft: true });
       checkMissions(state, tank.owner, { timing: "immediate" });
+      if (missionPaused(state, { kind: "finish-tank", tankId: tank.id })) return;
       return finishTankMove(state, tank);
     }
     const left = tank.loc;
@@ -483,6 +574,7 @@ function moveTank(state, action) {
   }
   refreshControl(state);
   checkMissions(state, state.active, { timing: "immediate" });
+  if (missionPaused(state, { kind: "finish-tank", tankId: tank.id })) return;
   finishTankMove(state, tank);
 }
 
@@ -790,10 +882,11 @@ function clearAttackReadout(state) {
 
 function closeDirectFire(state, side, target, hits) {
   refreshControl(state);
-  checkMissions(state, side, { timing: "combat", hits, target });
+  const choosing = checkMissions(state, side, { timing: "combat", hits, target }) === "choose";
   state.combat = null;
-  state.pending = { type: "action", step: "attack" };
   clearAttackReadout(state);
+  if (choosing) return;
+  state.pending = { type: "action", step: "attack" };
   if (state.missionExhausted) endGame(state, "Mission Exhaustion");
 }
 
@@ -993,10 +1086,11 @@ function markMortarFired(state, unit, hits, target) {
   state.players[side].attackedIds.push(unit.id);
   state.players[side].firedEquip.push(unit.id);
   refreshControl(state);
-  checkMissions(state, side, { timing: "combat", hits, target });
+  const choosing = checkMissions(state, side, { timing: "combat", hits, target }) === "choose";
   state.combat = null;
-  state.pending = { type: "action", step: "attack" };
   clearAttackReadout(state);
+  if (choosing) return;
+  state.pending = { type: "action", step: "attack" };
   if (state.missionExhausted) endGame(state, "Mission Exhaustion");
 }
 
@@ -1122,29 +1216,38 @@ function skipRegroup(state) {
       return;
     }
   }
-  scheduledMissions(state);
+  if (scheduledMissions(state)) return;
   if (state.phase === "end") return;
   endRound(state);
 }
 
 function scheduledMissions(state) {
-  if (![3, 6, 9].includes(state.round)) return;
-  const order = [state.player1, other(state.player1)];
-  for (const side of order) {
-    const card = drawMission(state, true);
-    if (!card) {
-      endGame(state, "Mission Exhaustion");
-      return;
-    }
-    state.players[side].missionHand.push(card);
-    log(state, `${labelSide(side)} draws a scheduled Mission (${card.title}).`);
-    checkMissions(state, side, { timing: "immediate" });
-    trimMissions(state, side);
-    if (state.missionExhausted) {
-      endGame(state, "Mission Exhaustion");
-      return;
-    }
+  if (![3, 6, 9].includes(state.round)) return false;
+  return runScheduled(state, [state.player1, other(state.player1)]);
+}
+
+function runScheduled(state, sides) {
+  if (state.phase === "end") return true;
+  if (!sides?.length) return false;
+  const side = sides[0];
+  const rest = sides.slice(1);
+  const card = drawMission(state, true);
+  if (!card) {
+    endGame(state, "Mission Exhaustion");
+    return true;
   }
+  state.players[side].missionHand.push(card);
+  log(state, `${labelSide(side)} draws a scheduled Mission (${card.title}).`);
+  if (checkMissions(state, side, { timing: "immediate" }) === "choose") {
+    state.pending.after = { kind: "scheduled", side, rest };
+    return true;
+  }
+  trimMissions(state, side);
+  if (state.missionExhausted) {
+    endGame(state, "Mission Exhaustion");
+    return true;
+  }
+  return runScheduled(state, rest);
 }
 
 function awardCasualtySuperiority(state, side, britainKills, germanyKills) {
@@ -1165,8 +1268,19 @@ function casualtySuperiority(state) {
 function endRound(state) {
   const briefStart = (state.roundBrief || []).length;
   casualtySuperiority(state);
-  checkMissions(state, "uk", { timing: "end" });
-  checkMissions(state, "de", { timing: "end" });
+  if (checkMissions(state, "uk", { timing: "end" }) === "choose") {
+    state.pending.after = { kind: "end-de", briefStart };
+    return;
+  }
+  if (checkMissions(state, "de", { timing: "end" }) === "choose") {
+    state.pending.after = { kind: "finish-round", briefStart };
+    return;
+  }
+  finishRound(state, briefStart);
+}
+
+function finishRound(state, briefStart) {
+  if (state.phase === "end") return;
   const closing = (state.roundBrief || []).slice(briefStart).map((line) => line.text);
   for (const s of state.soldiers) {
     if (s.loc === "casualties") {

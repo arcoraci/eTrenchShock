@@ -3,10 +3,11 @@ import { apply, isInteractive } from "./game.js";
 import { canRegroup, hasWildFace } from "./dice.js";
 import { createGame } from "./setup.js";
 import { soldiersIn } from "./core.js";
+import { preferredMissionAction } from "./missions.js";
 
 function pendingSide(state) {
   const pending = state.pending || {};
-  if (pending.type === "generals-order" || pending.type === "spotter" || pending.type === "mortar-target" || pending.type === "gambit") {
+  if (pending.type === "generals-order" || pending.type === "spotter" || pending.type === "mortar-target" || pending.type === "gambit" || pending.type === "pick-mission") {
     return pending.side;
   }
   if (state.phase === "reroll" || state.phase === "action" || state.phase === "regroup") return state.active;
@@ -22,6 +23,8 @@ export function needsHuman(state) {
 }
 
 function skipFor(state) {
+  const mission = preferredMissionAction(state);
+  if (mission) return mission;
   if (state.pending?.type === "gambit" && state.pending.stage === "keep") {
     return { type: "PICK_GAMBIT", inst: state.pending.cards[0]?.inst };
   }

@@ -887,7 +887,9 @@ button { cursor: pointer; }
   line-height: 1.4;
   letter-spacing: 0;
   text-transform: none;
+  overflow-wrap: anywhere;
 }
+.game-menu a { color: var(--brass); }
 .pause-veil {
   position: fixed;
   inset: 0;
