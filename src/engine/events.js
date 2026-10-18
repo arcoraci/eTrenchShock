@@ -13,6 +13,7 @@ import {
   ZONE_LABELS,
   refreshControl,
   nextSeed,
+  noteMoved,
 } from "./core.js";
 import { rollHits, remaining } from "./dice.js";
 import { applyHits, eliminateSoldier } from "./combat.js";
@@ -96,6 +97,7 @@ function moveGroup(state, side, params, maximum, allowBack) {
   for (const s of soldiers) {
     s.coverId = null;
     s.loc = dest;
+    noteMoved(state, side, s.id);
   }
   log(state, `${soldiers.length} Soldier(s) move to ${ZONE_LABELS[dest]}.`);
 }
@@ -267,6 +269,7 @@ function raid(state, side, params) {
   for (const s of soldiers) {
     s.loc = dest;
     s.coverId = null;
+    noteMoved(state, side, s.id);
   }
   let cover = null;
   for (const c of coversIn(state, dest)) {
@@ -366,6 +369,8 @@ function armoredAdvance(state, side, params) {
   if (!tank) throw new Error("Choose a Tank on the battlefield.");
   const dest = stepZone(side, tank.loc, "forward");
   if (!dest) throw new Error("That Tank cannot advance.");
+  const movedTanks = state.players[side].movedTanks || (state.players[side].movedTanks = []);
+  if (!movedTanks.includes(tank.id)) movedTanks.push(tank.id);
   if (dest === enemyTrench(side)) {
     state.vp[side] += 1;
     tank.loc = "supply";

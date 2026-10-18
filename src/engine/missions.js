@@ -1,4 +1,4 @@
-import { log, labelSide, soldiersIn, controllerOf, enemySideZones, BATTLEFIELD } from "./core.js";
+import { log, labelSide, pushRoundBrief, soldiersIn, controllerOf, enemySideZones, BATTLEFIELD } from "./core.js";
 
 export function drawMission(state, required) {
   if (!state.missionDeck.length) {
@@ -30,7 +30,9 @@ function completeMission(state, side, mission) {
   p.completedMissions.push(mission);
   if (!state.missionPulse) state.missionPulse = [];
   state.missionPulse.push({ side, inst: mission.inst, title: mission.title, vp: mission.vp });
-  log(state, `${labelSide(side)} completes ${mission.title} (+${mission.vp} VP).`);
+  const missionText = `${labelSide(side)} completes ${mission.title} (+${mission.vp} VP).`;
+  log(state, missionText);
+  pushRoundBrief(state, missionText);
   const replacement = drawMission(state, true);
   if (replacement) {
     p.missionHand.push(replacement);

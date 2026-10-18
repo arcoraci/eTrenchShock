@@ -15,6 +15,7 @@ export function emptyPlayer(side) {
     destroyedCover: [],
     generalsOrderUsed: false,
     attackedIds: [],
+    movedIds: [],
     movedEquip: [],
     firedEquip: [],
     spent: { boot: 0, shovel: 0, bayonet: 0, whistle: 0 },
@@ -169,6 +170,7 @@ export function beginInitiative(state) {
     p.wildAs = null;
     p.generalsOrderUsed = false;
     p.attackedIds = [];
+    p.movedIds = [];
     p.movedEquip = [];
     p.firedEquip = [];
     p.spent = { boot: 0, shovel: 0, bayonet: 0, whistle: 0 };
@@ -243,6 +245,7 @@ export function createGame(events, missions, options = {}) {
     missionExhausted: false,
     missionPulse: [],
     killPulse: [],
+    roundBrief: [],
   };
   buildSoldiers(state);
   buildEquipment(state);

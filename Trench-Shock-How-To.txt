@@ -1,0 +1,81 @@
+Trench Shock
+How to install, play, and send your results
+
+Get the game
+https://github.com/arcoraci/eTrenchShock
+
+Download
+Open that page in a browser.
+Click Code, then Download ZIP.
+Unzip the file. Open the folder that contains index.html, start.bat, and a folder named src. Leave those files together.
+
+Or clone
+Open a terminal and run:
+
+git clone https://github.com/arcoraci/eTrenchShock.git
+
+Then:
+
+cd eTrenchShock
+
+What you need
+Python 3. Download it from https://www.python.org/downloads/ if it is not already installed. There is nothing to build.
+
+Windows
+Double-click start.bat. A black window opens and should open the game in your browser. Leave that window open while you play.
+If it says Python is not recognized, install Python 3 again and turn on "Add python.exe to PATH" during setup, then double-click start.bat again.
+Or open a terminal in the game folder and run:
+
+python -m http.server 8080
+
+Mac or Linux
+Open a terminal in the game folder and run:
+
+python3 -m http.server 8080
+
+Leave that terminal open while you play.
+
+Open the game
+In a web browser, go to:
+
+http://127.0.0.1:8080
+
+Do not double-click index.html. The game only works from that address.
+
+Who you play
+On the first screen, set Opposition.
+
+Pass and play is two people on one computer. Britain's trench is on the left, Germany's is on the right. Press Begin battle. When it says "Pass the seat," hand the computer over and press "I am Britain" or "I am Germany".
+
+Headquarters is one person. Choose Britain or Germany, then press Begin battle.
+
+Stop
+Click the terminal window that started the game and press Ctrl+C.
+On Windows, if it then says to press any key, press a key to close it.
+
+Save the results
+When the battle ends, the result line shows who won, next to New battle and Export to Excel. The same Export to Excel button is in the Menu.
+
+It downloads trench-shock-balance.xlsx. This browser keeps every finished battle in that file. Another computer, or a different browser, has its own list.
+
+The workbook has three sheets:
+
+Games. One row per finished battle: winner, victory points, rounds, how it ended, missions, and whether each side was Human or AI.
+
+Log. The messages from the battle you just finished. Export from the result line so this sheet is that battle. Exporting while a battle is still going does not include it.
+
+Summary. Games played, wins, draws, and win rates.
+
+A game is recorded only when the battle ends. Quitting from the Menu in the middle of a battle does not count.
+
+Rename the file
+Rename it before you upload so players do not overwrite each other:
+
+trench-shock-YOURNAME-YYYY-MM-DD.xlsx
+
+Example: trench-shock-Alex-2026-10-18.xlsx
+
+Upload to Google Drive
+https://drive.google.com/drive/folders/1cSSnIyg2fDs2_ZY9mAUL10WVElmW1OrF?usp=sharing
+
+Open the link. Sign in if asked. Click New, then File upload, and choose the renamed spreadsheet.

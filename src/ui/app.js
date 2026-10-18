@@ -27,12 +27,22 @@ import {
 } from "../engine/core.js";
 import { remaining, comboLabel, naturalFaces, unusedDice, hasWildFace } from "../engine/dice.js";
 import { apply, isInteractive, canDeployMortar, machineGunsInSupply, mortarsInSupply, tanksInSupply, tanksReadyToMove } from "../engine/game.js";
+import {
+  EMPTY_SKIP,
+  coverCountdown,
+  coverCountdownText,
+  emptyStepReason,
+  pinnedInitiative,
+  sameActionSeat,
+  undoOffer,
+} from "../engine/feedback.js";
 import { eventNeeds, bayonetDestinations } from "../engine/events.js";
 import { allocationReady } from "../engine/combat.js";
 import {
   FILENAME,
   recordFinished,
   readLedger,
+  summarize,
   onBattleLoaded,
   dropIfUnfinished,
   ensureMatchId,
@@ -51,6 +61,9 @@ const STEPS = [
 
 const FACES = ["boot", "whistle", "wild", "shovel", "bayonet"];
 const FACE_LABEL = { boot: "Boot", whistle: "Whistle", wild: "Wild", shovel: "Shovel", bayonet: "Bayonet" };
+const TRENCH_LINE = ["ukTrench", "uk1", "uk2", "uk3", "obj", "de3", "de2", "de1", "deTrench"];
+const ATTACK_ICON = { hit: "assets/die-hit.png", miss: "assets/die-miss.png" };
+const MORTAR_ICON = { z1: "assets/die-zone1.png", z2: "assets/die-zone2.png", z3: "assets/die-zone3.png" };
 
 let catalog = null;
 let state = null;
@@ -77,6 +90,11 @@ let savedStamp = null;
 let leaveAsk = null;
 let stepReturn = null;
 let actionCapture = null;
+let actionUndo = null;
+let attackDraft = null;
+let emptyTimer = 0;
+let emptyMemo = null;
+let holdEmpty = null;
 
 function freshUi() {
   return {
@@ -124,10 +142,9 @@ function myTurn() {
   return actorSide() === state.human;
 }
 
-function boardOrder() {
-  const bottom = state.mode === "hotseat" ? "uk" : state.human;
-  if (bottom === "uk") return ["deTrench", "de1", "de2", "de3", "obj", "uk3", "uk2", "uk1", "ukTrench"];
-  return ["ukTrench", "uk1", "uk2", "uk3", "obj", "de3", "de2", "de1", "deTrench"];
+function clearEmptyTimer() {
+  window.clearTimeout(emptyTimer);
+  emptyTimer = 0;
 }
 
 function helmet(side) {
@@ -174,6 +191,23 @@ function clearAttackSelection() {
   ui.allocStack = [];
 }
 
+function trackUndo(action, before, after) {
+  const decision = undoOffer(before, after, action, attackDraft);
+  if (decision.pending) {
+    attackDraft = decision.before;
+    actionUndo = null;
+    return;
+  }
+  attackDraft = null;
+  if (decision.kind) {
+    actionUndo = { kind: decision.kind, before: decision.before };
+    holdEmpty = null;
+    return;
+  }
+  actionUndo = null;
+  holdEmpty = null;
+}
+
 function commit(action, opts = {}) {
   if (actionCapture) {
     actionCapture.push(action);
@@ -183,9 +217,10 @@ function commit(action, opts = {}) {
   const prev = actorSide();
   const beforePulse = (state?.missionPulse || []).map((pulse) => `${pulse.side}:${pulse.inst}`);
   const beforeKills = (state?.killPulse || []).map((note) => note.id);
+  const undoSnap = clone(state);
   if (state) ensureMatchId(state);
   if (opts.leaving) {
-    const snapshot = clone(state);
+    const snapshot = undoSnap;
     const arrived = apply(state, action);
     if (arrived.error) {
       state = arrived;
@@ -198,14 +233,14 @@ function commit(action, opts = {}) {
       stepReturn = returnOffer(snapshot, arrived, state);
     }
   } else {
-    const before = setup.undo === "on" ? clone(state) : null;
     state = play(state, action);
-    if (!state.error && before) {
-      history.push(before);
+    if (!state.error && setup.undo === "on") {
+      history.push(undoSnap);
       if (history.length > 30) history.shift();
     }
     if (!state.error) stepReturn = null;
   }
+  if (!state.error) trackUndo(action, undoSnap, state);
   if (!state.error) noteBattleOutcome(state);
   if (!state.error) queueKillCelebration(beforeKills, state);
   if (!state.error) queueMissionCelebration(beforePulse, state);
@@ -558,9 +593,12 @@ function backToSkipped() {
   const snap = stepReturn.snapshot;
   stepReturn = null;
   leaveAsk = null;
+  actionUndo = null;
+  attackDraft = null;
   if (history.length && history[history.length - 1] === snap) history.pop();
   clearMissionCelebration();
   state = snap;
+  holdEmpty = { step: state.actionStep, active: state.active, round: state.round };
   forgetUndoneResult(state);
   const tab = ui.tab;
   ui = freshUi();
@@ -592,6 +630,9 @@ function undoLast() {
   clearMissionCelebration();
   stepReturn = null;
   leaveAsk = null;
+  actionUndo = null;
+  attackDraft = null;
+  holdEmpty = null;
   state = history.pop();
   forgetUndoneResult(state);
   const tab = ui.tab;
@@ -599,6 +640,31 @@ function undoLast() {
   ui.tab = tab;
   ui.acked = actorSide();
   render();
+}
+
+function undoLastAction() {
+  if (!actionUndo || !sameActionSeat(actionUndo.before, state)) return;
+  const snap = actionUndo.before;
+  if (history.length && history[history.length - 1] === snap) history.pop();
+  clearMissionCelebration();
+  stepReturn = null;
+  leaveAsk = null;
+  actionUndo = null;
+  attackDraft = null;
+  holdEmpty = null;
+  state = snap;
+  forgetUndoneResult(state);
+  const tab = ui.tab;
+  ui = freshUi();
+  ui.tab = tab;
+  ui.acked = actorSide();
+  render();
+}
+
+function actionUndoButton() {
+  if (!actionUndo || !myTurn() || !sameActionSeat(actionUndo.before, state)) return "";
+  const label = actionUndo.kind === "attack" ? "Undo last attack" : "Undo last move";
+  return `<button type="button" data-click="undo-action">${label}</button>`;
 }
 
 function undoButton(extra = "") {
@@ -772,6 +838,7 @@ function renderZone(id) {
   const covers = coversIn(state, id);
   const gear = state.equipment.filter((u) => u.loc === id);
   const ground = id === "obj" ? "obj" : id.startsWith("uk") ? "uk-ground" : id.startsWith("de") ? "de-ground" : "";
+  const nation = id.startsWith("uk") ? `<span class="nation uk">Britain</span>` : id.startsWith("de") ? `<span class="nation de">Germany</span>` : `<span class="nation">Both sides</span>`;
   const classes = ["zone", ground, id.includes("Trench") ? "trench" : "", ui.zone === id ? "picked" : "", legalZones().includes(id) ? "legal" : "", state.effects.smoke.includes(id) ? "smoke" : ""];
   let ctrl = "";
   if (isBattlefield(id)) {
@@ -783,11 +850,22 @@ function renderZone(id) {
     ctrl = `<em>${countAt(side, id)} / 5</em>in the trench`;
   }
   const smoke = state.effects.smoke.includes(id) ? `<span class="zone-meta">Smoke screen</span>` : "";
+  const counts = ukAll.length || deAll.length ? `${ukAll.length} British · ${deAll.length} German` : "Empty";
   return `<div class="${classes.filter(Boolean).join(" ")}" data-click="zone" data-id="${id}">
-    <div class="zone-name"><strong>${esc(ZONE_LABELS[id])}</strong>${ukAll.length || deAll.length ? `${ukAll.length} British · ${deAll.length} German` : "Empty"}${smoke}</div>
+    <div class="zone-name">${nation}<strong>${esc(ZONE_LABELS[id])}</strong>${counts}${smoke}</div>
     <div class="zone-body">${uk.map((s) => soldierButton(s)).join("")}${covers.map(coverButton).join("")}${gear.map(unitButton).join("")}${de.map((s) => soldierButton(s)).join("")}</div>
     <div class="zone-ctrl">${ctrl}</div>
   </div>`;
+}
+
+function actionFlag(owner, id) {
+  const player = state.players[owner];
+  if (!player) return { className: "", mark: "" };
+  const attacked = (player.attackedIds || []).includes(id) || (player.firedEquip || []).includes(id);
+  const moved = (player.movedIds || []).includes(id) || (player.movedEquip || []).includes(id) || (player.movedTanks || []).includes(id);
+  if (attacked) return { className: "spent", mark: `<i class="mark-flag">Spent</i>` };
+  if (moved) return { className: "moved", mark: `<i class="mark-flag moved">Moved</i>` };
+  return { className: "", mark: "" };
 }
 
 function allocMark(id) {
@@ -800,26 +878,66 @@ function allocMark(id) {
 function soldierButton(soldier, inCover = false) {
   const selected = ui.soldiers.includes(soldier.id) ? "selected" : "";
   const targeted = ui.enemy === soldier.id ? "targeted" : "";
-  const used = state.players[soldier.owner].attackedIds.includes(soldier.id) ? "used" : "";
+  const flag = actionFlag(soldier.owner, soldier.id);
   const mark = allocMark(soldier.id);
-  const title = `${labelSide(soldier.owner)} soldier, ${inCover ? "in this cover" : "exposed"}${mark.count ? `, ${mark.count} hit${mark.count === 1 ? "" : "s"} assigned` : ""}`;
-  return `<button type="button" class="token ${soldier.owner} ${selected} ${targeted} ${used} ${mark.on ? "alloc" : ""} ${inCover ? "nested" : ""}" data-click="soldier" data-id="${soldier.id}" aria-label="${esc(title)}" title="${esc(title)}">${helmet(soldier.owner)}</button>`;
+  const title = `${labelSide(soldier.owner)} soldier, ${inCover ? "in this cover" : "exposed"}${flag.className ? `, ${flag.className}` : ""}${mark.count ? `, ${mark.count} hit${mark.count === 1 ? "" : "s"} assigned` : ""}`;
+  return `<button type="button" class="token ${soldier.owner} ${selected} ${targeted} ${flag.className} ${mark.on ? "alloc" : ""} ${inCover ? "nested" : ""}" data-click="soldier" data-id="${soldier.id}" aria-label="${esc(title)}" title="${esc(title)}">${helmet(soldier.owner)}${flag.mark}</button>`;
+}
+
+function coverFightPreview(cover) {
+  const pending = state.pending;
+  if (pending?.type !== "allocate-hits") return null;
+  const target = pending.target;
+  if (!target?.coverId || target.coverId !== cover.id) return null;
+  if (target.kind !== "cover" && target.kind !== "cover-empty") return null;
+  const stacking = (pending.options || []).length > 1;
+  const chosen = stacking ? (ui.allocStack || []).length : pending.hits;
+  const occ = target.kind === "cover" ? soldiersIn(state, cover.loc, { matchCover: true, coverId: cover.id }).length : 0;
+  return coverCountdown(cover.defense, chosen, occ);
+}
+
+function allocationCoverLine() {
+  const pending = state.pending;
+  if (pending?.type !== "allocate-hits" || !pending.target?.coverId) return "";
+  const cover = state.covers.find((token) => token.id === pending.target.coverId);
+  if (!cover) return "";
+  const preview = coverFightPreview(cover);
+  if (!preview) return "";
+  const occ = pending.target.kind === "cover" ? soldiersIn(state, cover.loc, { matchCover: true, coverId: cover.id }).length : 0;
+  return coverCountdownText(cover.defense, preview.hits, occ);
 }
 
 function coverButton(cover) {
   const selected = ui.cover === cover.id ? "selected" : "";
   const occ = soldiersIn(state, cover.loc, { matchCover: true, coverId: cover.id });
-  const value = cover.revealed ? String(cover.defense) : "?";
+  const preview = coverFightPreview(cover);
+  let value = cover.revealed ? String(cover.defense) : "?";
+  let live = "";
+  if (preview) {
+    value = preview.destroyed ? "0" : String(preview.remaining);
+    if (preview.nextDestroys) live = "next-break";
+    else if (preview.nextEliminates) live = "next-loss";
+    else if (preview.destroyed) live = "broken";
+  }
   const mark = allocMark(cover.id);
-  const title = `Cover ${cover.revealed ? "defense " + cover.defense : "unrevealed"}, ${occ.length} inside${mark.count ? `, ${mark.count} hits assigned` : ""}`;
+  const title = preview
+    ? coverCountdownText(cover.defense, preview.hits, pendingOccupants(cover, preview))
+    : `Cover ${cover.revealed ? "defense " + cover.defense : "unrevealed"}, ${occ.length} inside${mark.count ? `, ${mark.count} hits assigned` : ""}`;
   const count = occ.length
     ? `<button type="button" class="cover-count" data-click="cover" data-id="${cover.id}" aria-label="${occ.length} in this cover">${occ.length}</button>`
     : "";
   return `<div class="dugout ${occ.length ? "held" : ""}">
-    <button type="button" class="cover ${cover.revealed ? "open" : ""} ${selected} ${mark.on ? "alloc" : ""}" data-click="cover" data-id="${cover.id}" aria-label="${esc(title)}" title="${esc(title)}"><img src="assets/cover-token.jpg" alt="" draggable="false"><b>${value}</b></button>
+    <button type="button" class="cover ${cover.revealed || preview ? "open" : ""} ${live} ${selected} ${mark.on ? "alloc" : ""}" data-click="cover" data-id="${cover.id}" aria-label="${esc(title)}" title="${esc(title)}"><img src="assets/cover-token.jpg" alt="" draggable="false"><b>${esc(value)}</b></button>
     <div class="occupants">${occ.map((s) => soldierButton(s, true)).join("")}</div>
     ${count}
   </div>`;
+}
+
+function pendingOccupants(cover, preview) {
+  if (!preview) return 0;
+  const pending = state.pending;
+  if (pending?.target?.kind !== "cover") return 0;
+  return soldiersIn(state, cover.loc, { matchCover: true, coverId: cover.id }).length;
 }
 
 function unitSrc(type, side) {
@@ -831,12 +949,13 @@ function unitSrc(type, side) {
 function unitButton(unit) {
   const selected = ui.unit === unit.id ? "selected" : "";
   const targeted = ui.targetUnit === unit.id ? "targeted" : "";
-  const used = state.players[unit.owner].attackedIds.includes(unit.id) ? "used" : "";
-  const dmg = unit.damage ? `<small>${unit.damage}</small>` : "";
+  const flag = actionFlag(unit.owner, unit.id);
+  const damaged = unit.damage ? "damaged" : "";
+  const dmg = unit.damage ? `<small class="dmg">${unit.damage}</small>` : "";
   const name = capType(unit.type);
   const mark = allocMark(unit.id);
-  const title = `${labelSide(unit.owner)} ${name}${unit.damage ? `, ${unit.damage} damage` : ""}${mark.count ? `, ${mark.count} hits assigned` : ""}`;
-  return `<button type="button" class="unit ${unit.type} ${unit.owner} ${selected} ${targeted} ${used} ${mark.on ? "alloc" : ""}" data-click="unit" data-id="${unit.id}" aria-label="${esc(title)}" title="${esc(title)}"><img src="${unitSrc(unit.type, unit.owner)}" alt="" draggable="false">${dmg}</button>`;
+  const title = `${labelSide(unit.owner)} ${name}${unit.damage ? `, ${unit.damage} damage` : ""}${flag.className ? `, ${flag.className}` : ""}${mark.count ? `, ${mark.count} hits assigned` : ""}`;
+  return `<button type="button" class="unit ${unit.type} ${unit.owner} ${selected} ${targeted} ${flag.className} ${damaged} ${mark.on ? "alloc" : ""}" data-click="unit" data-id="${unit.id}" aria-label="${esc(title)}" title="${esc(title)}"><img src="${unitSrc(unit.type, unit.owner)}" alt="" draggable="false">${dmg}${flag.mark}</button>`;
 }
 
 function chargeSelection(me) {
@@ -965,11 +1084,14 @@ function promptText() {
     const stacking = pending.options.length > 1;
     const remain = stacking ? pending.hits - (ui.allocStack || []).length : pending.hits;
     const place = ZONE_LABELS[pending.zone] || "the target";
+    const coverLine = allocationCoverLine();
     if (!stacking) {
       const only = pending.options[0];
-      return `Hits remaining: ${remain}. ${only ? only.label : place} is the only legal target. Confirm to assign ${pending.hits === 1 ? "the hit" : "every hit"}.`;
+      const base = `Hits remaining: ${remain}. ${only ? only.label : place} is the only legal target. Confirm to assign ${pending.hits === 1 ? "the hit" : "every hit"}.`;
+      return coverLine ? `${coverLine} ${base}` : base;
     }
-    return `Hits remaining: ${remain}. The attack on ${place} rolled ${pending.hits} hit${pending.hits === 1 ? "" : "s"}. Click a target to assign a hit. Click that target again to take the hit off.`;
+    const base = `Hits remaining: ${remain}. The attack on ${place} rolled ${pending.hits} hit${pending.hits === 1 ? "" : "s"}. Click a target to assign a hit. Click that target again to take the hit off.`;
+    return coverLine ? `${coverLine} ${base}` : base;
   }
   if (state.pending?.type === "gambit" && state.pending.stage === "keep") {
     return "Mission Gambit: keep one of these two Missions. The other goes to the bottom of the deck. Your five dice stay available.";
@@ -1006,6 +1128,10 @@ function promptText() {
     cover: "A Shovel digs one exposed soldier into cover in the same zone. Select the soldier. Cover holds three of your soldiers and hides its defense until fired on, scouted, or reconnoitered.",
     attack: "Soldiers in cover can fire and can be targeted. Select your soldiers or a weapon, then a target. Soldiers and a machine gun that can each reach the same target fire together and add their dice, while mortars and tanks shoot on their own. Each attack die is 3 Hit and 3 Miss. Soldiers roll 1 and shoot one zone. Machine guns roll 3, or 4 at the objective, out to two zones, and cannot shoot tanks. Tanks roll 3 at an adjacent zone or overrun cover beneath them. Each unit attacks once. After soldiers, a machine gun, or a tank roll hits, you assign those hits to the legal targets.",
   };
+  if (state.phase === "action" && state.pending?.type === "action") {
+    const empty = emptyStepView();
+    if (empty?.reason) return empty.reason;
+  }
   if (state.phase === "action" && state.actionStep === "deploy") {
     const bayonets = remaining(state, me, "bayonet");
     const selected = selectedBayonetIndexes(me).length;
@@ -1071,7 +1197,8 @@ function hitAllocationButtons() {
   const stack = ui.allocStack || [];
   const stacking = options.length > 1;
   const remain = stacking ? pending.hits - stack.length : pending.hits;
-  attackHint = `Hits remaining: ${remain}.`;
+  const coverLine = allocationCoverLine();
+  attackHint = coverLine ? `${coverLine} Hits remaining: ${remain}.` : `Hits remaining: ${remain}.`;
   if (!stacking) {
     const only = options[0];
     return [{
@@ -1845,12 +1972,21 @@ function buttonRow(list) {
   buttons = list;
   const hintText = [attackHint, deployNote].filter(Boolean).join(" ");
   const hint = hintText ? `<div class="hint">${esc(hintText)}</div>` : "";
-  return `${hint}<div class="actions">${list.map((b, i) => `<button type="button" class="${b.primary ? "primary" : ""}" data-click="act" data-i="${i}"${b.hint ? ` data-tip="${esc(b.hint)}"` : ""}>${esc(b.label)}</button>`).join("")}</div>`;
+  return `${hint}<div class="actions">${actionUndoButton()}${list.map((b, i) => `<button type="button" class="${b.primary ? "primary" : ""}" data-click="act" data-i="${i}"${b.hint ? ` data-tip="${esc(b.hint)}"` : ""}>${esc(b.label)}</button>`).join("")}</div>`;
 }
 
 function attackDieFace(face) {
   const hit = face === "hit";
-  return `<span class="die attack ${hit ? "hit" : "miss"}"><span>${hit ? "Hit" : "Miss"}</span></span>`;
+  const src = ATTACK_ICON[hit ? "hit" : "miss"];
+  const word = hit ? "Hit" : "Miss";
+  return `<span class="die attack ${hit ? "hit" : "miss"}"><img src="${src}" alt="" draggable="false"><span>${word}</span></span>`;
+}
+
+function mortarDieFace(face) {
+  const src = MORTAR_ICON[face];
+  const word = face === "z1" ? "Zone 1" : face === "z2" ? "Zone 2" : face === "z3" ? "Zone 3" : mortarName(viewer(), face);
+  if (!src) return `<span class="die attack miss"><span>${esc(word)}</span></span>`;
+  return `<span class="die attack zone"><img src="${src}" alt="" draggable="false"><span>${esc(word)}</span></span>`;
 }
 
 function attackReadoutLive() {
@@ -1875,7 +2011,7 @@ function lastRoll() {
   }
   if (!roll?.faces?.length) return "";
   if (roll.kind === "mortar") {
-    return `<div class="roll-readout"><span>Mortar die</span>${roll.faces.map((f) => `<span class="${f === "blank" ? "blankface" : "hit"}">${esc(mortarName(viewer(), f))}</span>`).join("")}</div>`;
+    return `<div class="dice-row"><span class="tag">Mortar</span>${roll.faces.map((face) => mortarDieFace(face)).join("")}</div>`;
   }
   const hits = roll.hits;
   return `<div class="dice-row"><span class="tag">Attack</span>${roll.faces.map(attackDieFace).join("")}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"} · 3 Hit / 3 Miss</span></div>`;
@@ -1919,20 +2055,34 @@ function sidebar() {
     <h3>Opponent</h3><p class="quiet">${labelSide(foe.side)} holds ${foe.eventHand.length} event${foe.eventHand.length === 1 ? "" : "s"}.</p></div>`;
 }
 
+function supplyToken(src, count, label) {
+  return `<div class="supply-token" title="${esc(label)} ${count}"><img src="${src}" alt="" draggable="false"><b>${count}</b><span>${esc(label)}</span></div>`;
+}
+
 function supplyLine() {
   const me = viewer();
-  const mine = state.equipment.filter((u) => u.owner === me && u.loc === "supply");
-  const icons = mine.map((u) => `<img class="supply-unit ${u.type}" src="${unitSrc(u.type, me)}" alt="${esc(capType(u.type))}" title="${esc(capType(u.type))}">`).join("");
-  const mortarNote = state.phase === "action" && state.actionStep === "deploy"
-    ? ` · Mortars left in supply ${mortarsInSupply(state, me)} · Machine guns left in supply ${machineGunsInSupply(state, me)} · Tanks left in supply ${tanksInSupply(state, me)}`
-    : "";
-  return `<div class="supply-line"><span>Supply ${icons || "empty"}${mortarNote} · Cover tokens ${state.coverSupply.length}</span><span>Reserves ${countAt(me, "available")} · Casualties ${countAt(me, "casualties")}</span></div>`;
+  const soldier = me === "de" ? "assets/soldier-german.png" : "assets/soldier-british.png";
+  const tank = me === "de" ? "assets/tank-german.png" : "assets/tank-british.png";
+  return `<div class="supply-row" aria-label="Supply">${supplyToken(soldier, countAt(me, "available"), "Soldiers")}${supplyToken("assets/mortar.png", mortarsInSupply(state, me), "Mortars")}${supplyToken("assets/machine-gun.png", machineGunsInSupply(state, me), "Machine guns")}${supplyToken(tank, tanksInSupply(state, me), "Tanks")}${supplyToken("assets/cover-token.jpg", state.coverSupply.length, "Cover")}</div>`;
+}
+
+function ledgerStats() {
+  let games = [];
+  try {
+    games = readLedger(localStorage);
+  } catch {
+    games = [];
+  }
+  return summarize(games);
 }
 
 function resultBanner() {
   if (state.phase !== "end") return "";
   const title = state.winner ? `${labelSide(state.winner)} wins` : "The battle is a draw";
-  return `<div class="result"><strong>${title}</strong><span>${state.vp.uk}–${state.vp.de} · ${esc(state.tiebreak || "")}</span><button type="button" class="primary" data-click="new">New battle</button><button type="button" data-click="export-excel">Export to Excel</button></div>`;
+  const stats = ledgerStats();
+  const games = `${stats.played} ${stats.played === 1 ? "game" : "games"}`;
+  const totals = `${games} · Britain ${stats.britain} · Germany ${stats.germany} · Draws ${stats.draws}`;
+  return `<div class="result"><strong>${title}</strong><span>${state.vp.uk}–${state.vp.de} · ${esc(state.tiebreak || "")}</span><button type="button" class="primary" data-click="new">New battle</button><button type="button" data-click="export-excel">Export to Excel</button><span class="ledger-totals">${esc(totals)}</span></div>`;
 }
 
 function showCardTip(el) {
@@ -2058,10 +2208,15 @@ function restoreSetup(record) {
 
 function leaveToSetup() {
   clearMissionCelebration();
+  clearEmptyTimer();
   state = null;
   history = [];
   leaveAsk = null;
   stepReturn = null;
+  actionUndo = null;
+  attackDraft = null;
+  holdEmpty = null;
+  emptyMemo = null;
   ui = freshUi();
   paused = false;
   menuOpen = false;
@@ -2072,9 +2227,14 @@ function leaveToSetup() {
 
 function applyLoad(record) {
   clearMissionCelebration();
+  clearEmptyTimer();
   history = [];
   leaveAsk = null;
   stepReturn = null;
+  actionUndo = null;
+  attackDraft = null;
+  holdEmpty = null;
+  emptyMemo = null;
   state = record.state;
   adoptIds(state);
   restoreSetup(record);
@@ -2395,12 +2555,65 @@ function onMenuKey(event) {
   }
 }
 
+function emptyStepView() {
+  if (!state || state.phase !== "action" || state.pending?.type !== "action" || !myTurn()) return null;
+  if (emptyMemo?.state === state && emptyMemo.step === state.actionStep && emptyMemo.active === state.active) {
+    return emptyMemo.view;
+  }
+  const empty = !stepHasLegalAction();
+  const view = empty ? { advance: true, reason: emptyStepReason(state, viewer()) || "" } : null;
+  emptyMemo = { state, step: state.actionStep, active: state.active, view };
+  return view;
+}
+
+function scheduleEmptyAdvance() {
+  clearEmptyTimer();
+  const view = emptyStepView();
+  if (!view?.advance || paused || leaveAsk || missionToast || killToast || menuOpen || ui.help) return;
+  if (holdEmpty && holdEmpty.step === state.actionStep && holdEmpty.active === state.active && holdEmpty.round === state.round) return;
+  const step = state.actionStep;
+  const active = state.active;
+  const round = state.round;
+  const type = EMPTY_SKIP[step];
+  if (!type) return;
+  emptyTimer = window.setTimeout(() => {
+    emptyTimer = 0;
+    if (!state || state.phase !== "action" || state.actionStep !== step || state.active !== active || state.round !== round) return;
+    if (state.pending?.type !== "action" || !myTurn() || paused || leaveAsk) return;
+    if (holdEmpty && holdEmpty.step === step && holdEmpty.active === active && holdEmpty.round === round) return;
+    if (stepHasLegalAction()) return;
+    commit({ type }, { leaving: true });
+  }, 900);
+}
+
+function roundNotes() {
+  if (Array.isArray(state.roundBrief)) {
+    return state.roundBrief.filter((line) => line && line.round === state.round).slice(-12);
+  }
+  const patterns = [/wins Initiative/, /mortar hits/i, /most kills/, /completes .+\(\+/];
+  return (state.log || [])
+    .filter((line) => line.round === state.round && patterns.some((re) => re.test(line.text || "")))
+    .slice(0, 12)
+    .reverse();
+}
+
+function roundLogHtml() {
+  const notes = roundNotes();
+  const items = notes.length
+    ? `<ul>${notes.map((line) => `<li>${esc(line.text)}</li>`).join("")}</ul>`
+    : `<p class="quiet">Nothing recorded yet this round.</p>`;
+  return `<div class="round-log"><h3>Round ${state.round}</h3>${items}</div>`;
+}
+
 function render() {
   hideCardTip();
+  clearEmptyTimer();
   const root = document.getElementById("app");
   const board = root.querySelector(".theatre");
+  const map = root.querySelector(".map-scroll");
   const side = root.querySelector(".side-scroll");
   const boardTop = board?.scrollTop || 0;
+  const mapLeft = map?.scrollLeft || 0;
   const sideTop = side?.scrollTop || 0;
   if (!state) {
     root.innerHTML = `${menuChrome()}${splashHtml()}`;
@@ -2424,8 +2637,9 @@ function render() {
       <button type="button" class="ghost" data-click="new">New battle</button>
     </header>
     <div class="layout">
-      <div class="theatre"><div class="board">${boardOrder().map(renderZone).join("")}</div>${supplyLine()}</div>
+      <div class="theatre"><div class="map-scroll"><div class="board">${TRENCH_LINE.map(renderZone).join("")}</div></div>${supplyLine()}</div>
       <aside class="sidebar">
+        ${roundLogHtml()}
         <div class="tabs">
           ${["events", "missions", "log"].map((tab) => `<button type="button" class="${ui.tab === tab ? "on" : ""}" data-click="tab" data-tab="${tab}">${tab}</button>`).join("")}
         </div>
@@ -2439,6 +2653,7 @@ function render() {
       <div class="prompt" aria-live="polite">${promptText()}</div>
       ${lastRoll()}
       ${initiativeLine()}
+      ${state.initiative?.winner ? `<div class="quiet table-label">On the table</div>` : ""}
       <div class="dice-row"><span class="tag">${labelSide(me)}${state.player1 === me ? " · first" : ""}</span>${state.players[me].dice.map((f, i) => dieButton(me, f, i)).join("")}${diceCombo(me)}</div>
       <div class="dice-row"><span class="tag">${labelSide(foeSide)}${state.player1 === foeSide ? " · first" : ""}</span>${state.players[foeSide].dice.map((f, i) => dieButton(foeSide, f, i)).join("")}${diceCombo(foeSide)}</div>
       ${wildControls()}
@@ -2454,16 +2669,29 @@ function render() {
   ${missionHtml()}
   ${leaveHtml()}`;
   const nextBoard = root.querySelector(".theatre");
+  const nextMap = root.querySelector(".map-scroll");
   const nextSide = root.querySelector(".side-scroll");
   if (nextBoard) nextBoard.scrollTop = boardTop;
+  if (nextMap) nextMap.scrollLeft = mapLeft;
   if (nextSide) nextSide.scrollTop = sideTop;
+  scheduleEmptyAdvance();
+}
+
+function pinFace(face) {
+  const src = FACE_ICON[face];
+  if (!src) return "";
+  return `<span class="pin-die"><img src="${src}" alt="" draggable="false"></span>`;
 }
 
 function initiativeLine() {
-  const init = state.initiative;
-  if (!init?.winner) return "";
-  const from = init.tieRolls ? "from the deciding roll" : "from the first roll";
-  return `<div class="quiet">Initiative ${from}: Britain ${esc(init.uk.label)}, Germany ${esc(init.de.label)}. ${esc(labelSide(init.winner))} acts first.</div>`;
+  const pin = pinnedInitiative(state);
+  if (!pin) return "";
+  const roll = pin.tieRolls ? "Deciding roll" : "Roll 1";
+  return `<div class="initiative-pin">
+    <div><b>${esc(labelSide(pin.winner))} wins initiative</b><span class="pin-note">${esc(roll)} · wilds ignored</span></div>
+    <div class="pin-side"><span>Britain</span>${pin.ukDice.map(pinFace).join("")}<em>${esc(pin.uk)}</em></div>
+    <div class="pin-side"><span>Germany</span>${pin.deDice.map(pinFace).join("")}<em>${esc(pin.de)}</em></div>
+  </div>`;
 }
 
 function diceCombo(side) {
@@ -2497,7 +2725,7 @@ function helpHtml() {
   if (!ui.help) return "";
   return `<div class="modal"><div class="modal-card"><div class="rules">
     <h2>How to play</h2>
-    <p>Two armies fight for the Objective Zone. Britain advances upward from the bottom trench in a solo game where you command Britain. Germany advances the other way. A tank in a zone contests it, so nobody controls that ground.</p>
+    <p>Two armies fight for the Objective Zone. Britain is on the left and advances to the right. Germany is on the right and advances to the left. A tank in a zone contests it, so nobody controls that ground.</p>
     <h3>The round</h3>
     <ul>
       <li>Both sides roll five action dice. That opening roll sets initiative. Wilds are ignored: they do not make a pair, a full house, or five of a kind. Five of a kind beats four, then a full house, three of a kind, two pair, one pair, then the highest face: Bayonet, Whistle, Shovel, Boot. If that comparison ties, both sides roll all five again and the tied roll is discarded. The roll-off does not use Roll 2 or Roll 3.</li>
@@ -2530,7 +2758,7 @@ function helpHtml() {
 
 function splashHtml() {
   const choice = (key, value, label) => `<button type="button" class="choice ${setup[key] === value ? "on" : ""}" data-click="setup" data-key="${key}" data-value="${value}">${label}</button>`;
-  const sideChoices = setup.mode === "hotseat" ? `<p class="quiet">Britain's trench stays at the bottom of the map. Pass the seat when asked.</p>` : `<div class="choices">${choice("human", "uk", "Britain")}${choice("human", "de", "Germany")}</div>`;
+  const sideChoices = setup.mode === "hotseat" ? `<p class="quiet">Britain's trench is on the left. Germany's is on the right. Pass the seat when asked.</p>` : `<div class="choices">${choice("human", "uk", "Britain")}${choice("human", "de", "Germany")}</div>`;
   return `<div class="splash"><div class="splash-card">
     <div class="portraits"><div class="badge uk">${helmet("uk")}</div><div class="badge de">${helmet("de")}</div></div>
     <h1>Trench Shock</h1>
@@ -2600,12 +2828,21 @@ function onClick(event) {
     undoLast();
     return;
   }
+  if (kind === "undo-action") {
+    undoLastAction();
+    return;
+  }
   if (kind === "begin") {
     clearMissionCelebration();
+    clearEmptyTimer();
     ui = freshUi();
     history = [];
     leaveAsk = null;
     stepReturn = null;
+    actionUndo = null;
+    attackDraft = null;
+    holdEmpty = null;
+    emptyMemo = null;
     paused = false;
     menuOpen = false;
     menuConfirm = null;

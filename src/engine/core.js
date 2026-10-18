@@ -143,6 +143,22 @@ export function log(state, text) {
   if (state.log.length > 80) state.log.length = 80;
 }
 
+export function pushRoundBrief(state, text) {
+  if (!state || !text) return;
+  if (!Array.isArray(state.roundBrief)) state.roundBrief = [];
+  const round = state.round || 1;
+  if (state.roundBrief.some((line) => line.round === round && line.text === text)) return;
+  state.roundBrief.push({ round, text });
+  state.roundBrief = state.roundBrief.filter((line) => line.round >= round - 1).slice(-16);
+}
+
+export function noteMoved(state, side, id) {
+  const player = state.players?.[side];
+  if (!player || !id) return;
+  if (!Array.isArray(player.movedIds)) player.movedIds = [];
+  if (!player.movedIds.includes(id)) player.movedIds.push(id);
+}
+
 export function soldiersIn(state, zone, opts = {}) {
   const { side = null, exposed = null, coverId = null, matchCover = false } = opts;
   return state.soldiers.filter((s) => {

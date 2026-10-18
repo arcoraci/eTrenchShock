@@ -18,6 +18,8 @@ import {
   ZONE_LABELS,
   smoked,
   canSoldierTarget,
+  noteMoved,
+  pushRoundBrief,
 } from "./core.js";
 import { beginInitiative } from "./setup.js";
 import {
@@ -206,10 +208,9 @@ function afterRoll1(state) {
   const winner = locked.winner;
   state.player1 = winner;
   const from = tieRolls ? "the deciding roll" : "Roll 1";
-  log(
-    state,
-    `${labelSide(winner)} wins Initiative from ${from} — Britain: ${locked.uk.label}. Germany: ${locked.de.label}. ${labelSide(winner)} will act first.`,
-  );
+  const initiativeText = `${labelSide(winner)} wins Initiative from ${from} — Britain: ${locked.uk.label}. Germany: ${locked.de.label}. ${labelSide(winner)} will act first.`;
+  log(state, initiativeText);
+  pushRoundBrief(state, initiativeText);
   state.phase = "reroll";
   state.active = other(winner);
   state.players.uk.rollsUsed = 1;
@@ -318,7 +319,10 @@ function startActionPhase(state, side) {
   state.actionStep = "shock";
   state.pending = { type: "action", step: "shock" };
   log(state, `${labelSide(side)} begins the Action Phase.`);
-  if (shouldSkipStep(state, side, "shock")) advanceStep(state);
+  if (shouldSkipStep(state, side, "shock")) {
+    if (isInteractive(state, side)) return;
+    advanceStep(state);
+  }
 }
 
 function advanceStep(state) {
@@ -327,7 +331,8 @@ function advanceStep(state) {
     i += 1;
     if (i >= STEPS.length) return finishActionPhase(state);
     const nxt = STEPS[i];
-    if (shouldSkipStep(state, state.active, nxt)) continue;
+    const skip = shouldSkipStep(state, state.active, nxt);
+    if (skip && !isInteractive(state, state.active)) continue;
     state.actionStep = nxt;
     state.pending = { type: "action", step: nxt };
     if (nxt === "event") state.players[state.active].eventsAtStep = state.players[state.active].eventHand.map((c) => c.inst);
@@ -620,6 +625,7 @@ function doMove(state, action) {
     spend(state, side, "boot", 1);
     soldier.loc = dest;
     soldier.coverId = null;
+    noteMoved(state, side, soldier.id);
     log(state, `${labelSide(side)} Soldier moves ${action.dir} to ${ZONE_LABELS[dest]}.`);
   } else {
     const unit = state.equipment.find((e) => e.id === action.unitId && e.owner === side);
@@ -961,6 +967,7 @@ function mortarEffectPhrases(state, target, before) {
 
 function showBattleNotice(state, side, text) {
   log(state, text);
+  pushRoundBrief(state, text);
   if (!state.killPulse) state.killPulse = [];
   state.killPulse.push({ id: state.killPulse.length, side, text });
 }
@@ -1156,9 +1163,11 @@ function casualtySuperiority(state) {
 }
 
 function endRound(state) {
+  const briefStart = (state.roundBrief || []).length;
   casualtySuperiority(state);
   checkMissions(state, "uk", { timing: "end" });
   checkMissions(state, "de", { timing: "end" });
+  const closing = (state.roundBrief || []).slice(briefStart).map((line) => line.text);
   for (const s of state.soldiers) {
     if (s.loc === "casualties") {
       s.loc = "available";
@@ -1173,6 +1182,8 @@ function endRound(state) {
   if (state.missionExhausted) return endGame(state, "Mission Exhaustion");
   if (state.round >= state.maxRounds) return endGame(state, "Final round");
   state.round += 1;
+  state.roundBrief = [];
+  for (const text of closing) pushRoundBrief(state, text);
   log(state, `Round ${state.round} begins.`);
   beginInitiative(state);
 }
