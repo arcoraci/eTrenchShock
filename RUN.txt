@@ -1,0 +1,43 @@
+Trench Shock
+How to run the game on your computer
+
+What you need
+  Python 3. Download it from https://www.python.org/downloads/ if it is not
+  already installed. You do not need an account, and there is nothing to build.
+
+Unzip
+  Unzip this file. Open the folder that contains index.html, start.bat, and a
+  folder named src. Leave those files together.
+
+Windows
+  Double-click start.bat. A black window opens and should open the game in
+  your browser. Leave that window open while you play.
+  If it says Python is not recognized, install Python 3 from python.org and
+  turn on "Add python.exe to PATH" during setup, then double-click start.bat
+  again.
+  Or open a terminal in the unzipped folder and run:
+
+      python -m http.server 8080
+
+Mac or Linux
+  Open a terminal in the unzipped folder and run:
+
+      python3 -m http.server 8080
+
+  Leave that terminal open while you play.
+
+Open the game
+  In a web browser, go to:
+
+      http://127.0.0.1:8080
+
+  Do not double-click index.html. The game only works from that address.
+
+Two people, one computer
+  On the first screen, set Opposition to Pass and play, then press Begin battle.
+  When the game says "Pass the seat," hand the computer to the other person.
+  One person can play alone by leaving Opposition on Headquarters.
+
+Stop
+  Click the terminal window that started the game and press Ctrl+C.
+  On Windows, if it then says to press any key, press a key to close it.

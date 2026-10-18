@@ -1,0 +1,2868 @@
+import { startMatch, play, runUntilHuman, simulateGames } from "../engine/loop.js";
+import {
+  BATTLEFIELD,
+  ZONE_LABELS,
+  labelSide,
+  controllerOf,
+  isContested,
+  isBattlefield,
+  soldiersIn,
+  coversIn,
+  stepZone,
+  sideZones,
+  ownZone1,
+  ownTrench,
+  enemySideZones,
+  capType,
+  zoneDistance,
+  clone,
+  resetIds,
+  smoked,
+  canSoldierTarget,
+  soldierMayFire,
+  soldierStrikeTargets,
+  infantryFireOffers,
+  machineGunOperational,
+  machineGunTargets,
+} from "../engine/core.js";
+import { remaining, comboLabel, naturalFaces, unusedDice, hasWildFace } from "../engine/dice.js";
+import { apply, isInteractive, canDeployMortar, machineGunsInSupply, mortarsInSupply, tanksInSupply, tanksReadyToMove } from "../engine/game.js";
+import { eventNeeds, bayonetDestinations } from "../engine/events.js";
+import { allocationReady } from "../engine/combat.js";
+import {
+  FILENAME,
+  recordFinished,
+  readLedger,
+  onBattleLoaded,
+  dropIfUnfinished,
+  ensureMatchId,
+  buildBalanceWorkbook,
+} from "../export/ledger.js";
+
+const STEPS = [
+  ["shock", "Shock"],
+  ["tank", "Tank"],
+  ["event", "Events"],
+  ["deploy", "Deploy"],
+  ["move", "Move"],
+  ["cover", "Cover"],
+  ["attack", "Attack"],
+];
+
+const FACES = ["boot", "whistle", "wild", "shovel", "bayonet"];
+const FACE_LABEL = { boot: "Boot", whistle: "Whistle", wild: "Wild", shovel: "Shovel", bayonet: "Bayonet" };
+
+let catalog = null;
+let state = null;
+let buttons = [];
+let attackHint = "";
+let deployNote = "";
+let history = [];
+let missionToast = null;
+let missionQueue = [];
+let missionTimer = 0;
+let missionSerial = 0;
+let killToast = null;
+let killQueue = [];
+let killTimer = 0;
+let killSerial = 0;
+let setup = { format: "standard", human: "uk", mode: "solo", undo: "off" };
+let ui = freshUi();
+const SAVE_KEY = "trench-shock-battle";
+let menuOpen = false;
+let paused = false;
+let menuNote = "";
+let menuConfirm = null;
+let savedStamp = null;
+let leaveAsk = null;
+let stepReturn = null;
+let actionCapture = null;
+
+function freshUi() {
+  return {
+    soldiers: [],
+    card: null,
+    cover: null,
+    unit: null,
+    targetUnit: null,
+    zone: null,
+    enemy: null,
+    dice: [],
+    dieIndex: null,
+    wildAs: null,
+    order: null,
+    supportType: "mg",
+    targetKind: "exposed",
+    dir: "forward",
+    acked: null,
+    help: false,
+    tab: "events",
+    allocStack: [],
+  };
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function actorSide() {
+  if (!state) return null;
+  if (state.pending?.type === "generals-order" || state.pending?.type === "spotter" || state.pending?.type === "mortar-target" || state.pending?.type === "gambit") {
+    return state.pending.side;
+  }
+  if (state.phase === "reroll" || state.phase === "action" || state.phase === "regroup") return state.active;
+  return state.human;
+}
+
+function viewer() {
+  return state?.mode === "hotseat" ? actorSide() : state?.human;
+}
+
+function myTurn() {
+  if (!state || state.phase === "end") return false;
+  if (state.mode === "hotseat") return ui.acked === actorSide();
+  return actorSide() === state.human;
+}
+
+function boardOrder() {
+  const bottom = state.mode === "hotseat" ? "uk" : state.human;
+  if (bottom === "uk") return ["deTrench", "de1", "de2", "de3", "obj", "uk3", "uk2", "uk1", "ukTrench"];
+  return ["ukTrench", "uk1", "uk2", "uk3", "obj", "de3", "de2", "de1", "deTrench"];
+}
+
+function helmet(side) {
+  const file = side === "uk" ? "soldier-british.png" : "soldier-german.png";
+  return `<img src="assets/${file}" alt="" draggable="false">`;
+}
+
+const FACE_ICON = {
+  boot: "assets/die-boot.png?v=2",
+  whistle: "assets/die-whistle.png?v=2",
+  wild: "assets/die-wild.png?v=2",
+  shovel: "assets/die-shovel.png?v=2",
+  bayonet: "assets/die-bayonet.png?v=2",
+};
+
+function faceSvg(face) {
+  const src = FACE_ICON[face];
+  if (!src) return "";
+  return `<img src="${src}" alt="" draggable="false">`;
+}
+
+function attackResolving(game) {
+  const type = game?.pending?.type;
+  return type === "allocate-hits" || type === "spotter" || type === "mortar-target";
+}
+
+function attackFinished(action, beforeStep) {
+  const type = action?.type;
+  if (type === "START_ATTACK" || type === "RESOLVE_ATTACK" || type === "ALLOCATE_HITS" || type === "ALLOCATE_MORTAR" || type === "OVERRUN" || type === "SKIP_ATTACK") {
+    return true;
+  }
+  if (type === "PICK_SPOTTER") return true;
+  if (type === "SHOCK" && action.option === "gas") return true;
+  return beforeStep === "attack" && (state.actionStep !== "attack" || state.phase !== "action");
+}
+
+function clearAttackSelection() {
+  ui.soldiers = [];
+  ui.cover = null;
+  ui.unit = null;
+  ui.targetUnit = null;
+  ui.enemy = null;
+  ui.zone = null;
+  ui.allocStack = [];
+}
+
+function commit(action, opts = {}) {
+  if (actionCapture) {
+    actionCapture.push(action);
+    return;
+  }
+  const beforeStep = state?.actionStep;
+  const prev = actorSide();
+  const beforePulse = (state?.missionPulse || []).map((pulse) => `${pulse.side}:${pulse.inst}`);
+  const beforeKills = (state?.killPulse || []).map((note) => note.id);
+  if (state) ensureMatchId(state);
+  if (opts.leaving) {
+    const snapshot = clone(state);
+    const arrived = apply(state, action);
+    if (arrived.error) {
+      state = arrived;
+    } else {
+      if (setup.undo === "on") {
+        history.push(snapshot);
+        if (history.length > 30) history.shift();
+      }
+      state = runUntilHuman(arrived);
+      stepReturn = returnOffer(snapshot, arrived, state);
+    }
+  } else {
+    const before = setup.undo === "on" ? clone(state) : null;
+    state = play(state, action);
+    if (!state.error && before) {
+      history.push(before);
+      if (history.length > 30) history.shift();
+    }
+    if (!state.error) stepReturn = null;
+  }
+  if (!state.error) noteBattleOutcome(state);
+  if (!state.error) queueKillCelebration(beforeKills, state);
+  if (!state.error) queueMissionCelebration(beforePulse, state);
+  if (!state.error && !opts.keepUi) {
+    ui.card = null;
+    ui.dice = [];
+    ui.dieIndex = null;
+    ui.order = null;
+    if (attackResolving(state)) {
+      ui.allocStack = [];
+    } else if (attackFinished(action, beforeStep)) {
+      clearAttackSelection();
+    } else {
+      ui.soldiers = [];
+      ui.cover = null;
+      ui.unit = null;
+      ui.targetUnit = null;
+      ui.enemy = null;
+      ui.allocStack = [];
+    }
+  }
+  if (actorSide() !== prev) ui.acked = null;
+  render();
+}
+
+function stepLabel(stepId) {
+  return STEPS.find(([id]) => id === stepId)?.[1] || "";
+}
+
+function askLeave(action) {
+  if (actionCapture) return;
+  if (!myTurn() || state?.phase !== "action") return;
+  const stepName = stepLabel(state.actionStep);
+  if (!stepName) return;
+  if (!stepHasLegalAction()) {
+    commit(action, { leaving: true });
+    return;
+  }
+  leaveAsk = { action, stepName };
+  render();
+}
+
+function confirmLeave() {
+  const ask = leaveAsk;
+  if (!ask) return;
+  leaveAsk = null;
+  commit(ask.action, { leaving: true });
+}
+
+function stayOnStep() {
+  if (!leaveAsk) return;
+  leaveAsk = null;
+  render();
+}
+
+const STEP_LEAVE_LABELS = new Set([
+  "Decline the Shock",
+  "Hold the tank",
+  "Done with events",
+  "Done deploying",
+  "Done moving",
+  "Done with cover",
+  "End attacks",
+]);
+
+function withSelection(patch, fn) {
+  const saved = {
+    soldiers: ui.soldiers,
+    card: ui.card,
+    cover: ui.cover,
+    unit: ui.unit,
+    targetUnit: ui.targetUnit,
+    zone: ui.zone,
+    enemy: ui.enemy,
+    dice: ui.dice,
+    dieIndex: ui.dieIndex,
+    dir: ui.dir,
+    supportType: ui.supportType,
+    targetKind: ui.targetKind,
+    attackHint,
+    deployNote,
+  };
+  if ("soldiers" in patch) ui.soldiers = (patch.soldiers || []).slice();
+  if ("card" in patch) ui.card = patch.card;
+  if ("cover" in patch) ui.cover = patch.cover;
+  if ("unit" in patch) ui.unit = patch.unit;
+  if ("targetUnit" in patch) ui.targetUnit = patch.targetUnit;
+  if ("zone" in patch) ui.zone = patch.zone;
+  if ("enemy" in patch) ui.enemy = patch.enemy;
+  if ("dice" in patch) ui.dice = (patch.dice || []).slice();
+  if ("dieIndex" in patch) ui.dieIndex = patch.dieIndex;
+  if ("dir" in patch) ui.dir = patch.dir;
+  if ("supportType" in patch) ui.supportType = patch.supportType;
+  if ("targetKind" in patch) ui.targetKind = patch.targetKind;
+  try {
+    return fn();
+  } finally {
+    ui.soldiers = saved.soldiers;
+    ui.card = saved.card;
+    ui.cover = saved.cover;
+    ui.unit = saved.unit;
+    ui.targetUnit = saved.targetUnit;
+    ui.zone = saved.zone;
+    ui.enemy = saved.enemy;
+    ui.dice = saved.dice;
+    ui.dieIndex = saved.dieIndex;
+    ui.dir = saved.dir;
+    ui.supportType = saved.supportType;
+    ui.targetKind = saved.targetKind;
+    attackHint = saved.attackHint;
+    deployNote = saved.deployNote;
+  }
+}
+
+function offeredActions(list) {
+  const found = [];
+  const previous = actionCapture;
+  actionCapture = found;
+  try {
+    for (const button of list) {
+      if (STEP_LEAVE_LABELS.has(button.label)) continue;
+      button.run();
+    }
+  } finally {
+    actionCapture = previous;
+  }
+  return found;
+}
+
+function anyLegalAction(list) {
+  for (const action of offeredActions(list)) {
+    if (!apply(clone(state), action).error) return true;
+  }
+  return false;
+}
+
+function bayonetIndexes(side) {
+  const indexes = [];
+  const dice = state.players[side].dice;
+  for (let index = 0; index < dice.length; index += 1) {
+    if (bayonetChoice(side, index)) indexes.push(index);
+  }
+  return indexes;
+}
+
+function deployStepHasAction(me) {
+  const indexes = bayonetIndexes(me);
+  const max = Math.min(4, indexes.length);
+  for (let n = 1; n <= max; n += 1) {
+    if (withSelection({ dice: indexes.slice(0, n) }, () => anyLegalAction(deployButtons(me)))) return true;
+  }
+  return false;
+}
+
+function moveStepHasAction(me) {
+  for (const soldier of state.soldiers) {
+    if (soldier.owner !== me) continue;
+    if (withSelection({ soldiers: [soldier.id], unit: null }, () => anyLegalAction(moveButtons(me)))) return true;
+  }
+  for (const unit of state.equipment) {
+    if (unit.owner !== me || unit.type === "tank") continue;
+    if (withSelection({ soldiers: [], unit: unit.id }, () => anyLegalAction(moveButtons(me)))) return true;
+  }
+  return false;
+}
+
+function coverStepHasAction(me) {
+  const blank = { soldiers: [], unit: null, cover: null, zone: null };
+  const trySel = (patch) => withSelection({ ...blank, ...patch }, () => anyLegalAction(coverButtons(me)));
+  for (const soldier of state.soldiers) {
+    if (soldier.owner !== me) continue;
+    const zone = isBattlefield(soldier.loc) ? soldier.loc : null;
+    if (trySel({ soldiers: [soldier.id], zone })) return true;
+  }
+  for (const zone of BATTLEFIELD) {
+    if (trySel({ zone })) return true;
+  }
+  for (const cover of state.covers) {
+    if (cover.destroyed) continue;
+    for (const zone of BATTLEFIELD) {
+      if (zone === cover.loc || zoneDistance(cover.loc, zone) !== 1) continue;
+      if (trySel({ cover: cover.id, zone })) return true;
+    }
+  }
+  return false;
+}
+
+function attackStepHasAction(me) {
+  const blank = { soldiers: [], unit: null, targetUnit: null, cover: null, zone: null };
+  const trySel = (patch) => withSelection({ ...blank, ...patch }, () => anyLegalAction(attackButtons(me)));
+  for (const unit of state.equipment) {
+    if (unit.owner !== me || !isBattlefield(unit.loc)) continue;
+    if (unit.type === "mortar") {
+      if (trySel({ unit: unit.id })) return true;
+      if (state.effects.precision.includes(unit.id)) {
+        for (const zone of BATTLEFIELD) {
+          if (trySel({ unit: unit.id, zone })) return true;
+        }
+      }
+    } else if (unit.type === "tank") {
+      for (const zone of BATTLEFIELD) {
+        if (zoneDistance(unit.loc, zone) > 1) continue;
+        if (trySel({ unit: unit.id, zone })) return true;
+      }
+      for (const cover of state.covers) {
+        if (cover.destroyed || cover.loc !== unit.loc) continue;
+        if (trySel({ unit: unit.id, cover: cover.id, zone: unit.loc })) return true;
+      }
+    } else if (unit.type === "mg") {
+      if (trySel({ unit: unit.id })) return true;
+    }
+  }
+  const foeUnits = state.equipment.filter((unit) => unit.owner !== me && isBattlefield(unit.loc));
+  for (const soldier of state.soldiers) {
+    if (soldier.owner !== me || !isBattlefield(soldier.loc)) continue;
+    if (state.players[me].attackedIds.includes(soldier.id)) continue;
+    for (const zone of BATTLEFIELD) {
+      if (zoneDistance(soldier.loc, zone) > 1) continue;
+      if (trySel({ soldiers: [soldier.id], zone })) return true;
+      for (const cover of state.covers) {
+        if (cover.destroyed || cover.loc !== zone) continue;
+        if (trySel({ soldiers: [soldier.id], zone, cover: cover.id })) return true;
+      }
+      for (const unit of foeUnits) {
+        if (unit.loc !== zone) continue;
+        if (trySel({ soldiers: [soldier.id], zone, targetUnit: unit.id })) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function eventCanPlay(me, card) {
+  if (card.title === "General's Order") return false;
+  const opened = state.players[me].eventsAtStep;
+  if (opened && !opened.includes(card.inst)) return false;
+  if (card.whistle !== false && remaining(state, me, "whistle") < 1) return false;
+  const needs = eventNeeds(card.title);
+  const zones = needs.some((need) => need === "zone" || need === "enemyZone" || need === "controlledZone")
+    ? BATTLEFIELD.slice()
+    : [null];
+  let soldierLists = [[]];
+  if (needs.includes("soldiers")) {
+    const byLoc = new Map();
+    for (const soldier of state.soldiers) {
+      if (soldier.owner !== me) continue;
+      if (!byLoc.has(soldier.loc)) byLoc.set(soldier.loc, []);
+      byLoc.get(soldier.loc).push(soldier.id);
+    }
+    soldierLists = [...byLoc.values()].map((ids) => ids.slice(0, 3));
+    if (!soldierLists.length) soldierLists = [[]];
+  }
+  let coverIds = [null];
+  if (needs.includes("covers") || needs.includes("enemyCover")) {
+    coverIds = state.covers.filter((cover) => !cover.destroyed).map((cover) => cover.id);
+    if (!coverIds.length) coverIds = [null];
+  }
+  let unitIds = [null];
+  if (needs.some((need) => need.startsWith("friendly"))) {
+    unitIds = state.equipment.filter((unit) => unit.owner === me).map((unit) => unit.id);
+    if (!unitIds.length) unitIds = [null];
+  }
+  let enemyIds = [null];
+  if (needs.includes("enemySoldier")) {
+    enemyIds = state.soldiers.filter((soldier) => soldier.owner !== me && isBattlefield(soldier.loc)).map((soldier) => soldier.id);
+    if (!enemyIds.length) enemyIds = [null];
+  }
+  const dieIndexes = needs.includes("enemyDie") ? [0, 1, 2, 3, 4] : [null];
+  const dirs = card.title === "Patrol" ? ["forward", "back"] : ["forward"];
+  const supports = needs.includes("supportType") ? ["mg", "mortar"] : ["mg"];
+  const barrage = card.title === "Heavy Barrage" || card.title === "Bombing Run";
+  const attempt = (patch) => withSelection({
+    card: card.inst,
+    soldiers: patch.soldiers || [],
+    zone: patch.zone ?? null,
+    cover: patch.cover ?? null,
+    unit: patch.unit ?? null,
+    targetUnit: patch.targetUnit ?? null,
+    enemy: patch.enemy ?? null,
+    dieIndex: patch.dieIndex ?? null,
+    dir: patch.dir || "forward",
+    supportType: patch.supportType || "mg",
+    targetKind: patch.targetKind || "exposed",
+  }, () => anyLegalAction(eventButtons(me)));
+  for (const zone of zones) {
+    for (const soldiers of soldierLists) {
+      for (const cover of coverIds) {
+        for (const unit of unitIds) {
+          for (const enemy of enemyIds) {
+            for (const dieIndex of dieIndexes) {
+              for (const dir of dirs) {
+                for (const supportType of supports) {
+                  const base = { soldiers, zone, cover, unit, enemy, dieIndex, dir, supportType };
+                  if (attempt({ ...base, targetKind: "exposed" })) return true;
+                  if (!barrage) continue;
+                  if (attempt({ ...base, targetKind: "cover" })) return true;
+                  const targetUnit = state.equipment.find((item) => item.owner !== me && item.loc === zone)?.id || null;
+                  if (attempt({ ...base, targetKind: "unit", targetUnit })) return true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function eventStepHasAction(me) {
+  return state.players[me].eventHand.some((card) => eventCanPlay(me, card));
+}
+
+function stepHasLegalAction() {
+  const me = viewer();
+  const step = state.actionStep;
+  if (!me || state?.phase !== "action") return false;
+  if (step === "shock" || step === "tank") return anyLegalAction(actionList());
+  if (step === "event") return eventStepHasAction(me);
+  if (step === "deploy") return deployStepHasAction(me);
+  if (step === "move") return moveStepHasAction(me);
+  if (step === "cover") return coverStepHasAction(me);
+  if (step === "attack") return attackStepHasAction(me);
+  return false;
+}
+
+function returnOffer(before, arrived, settled) {
+  if (!before || !arrived || arrived.error || settled?.error) return null;
+  if (settled !== arrived || settled.phase === "end") return null;
+  const actor = settled.active || before.active;
+  if (before.phase !== "action" || !isInteractive(settled, before.active) || !isInteractive(settled, actor)) return null;
+  const stepName = stepLabel(before.actionStep);
+  if (!stepName) return null;
+  if (settled.phase === "action" && settled.actionStep === before.actionStep && settled.active === before.active) return null;
+  return { snapshot: before, stepName, active: before.active };
+}
+
+function veilShowing() {
+  return Boolean(state && state.mode === "hotseat" && state.phase !== "end" && ui.acked !== actorSide() && actorSide());
+}
+
+function backVisible() {
+  if (!stepReturn || !state || state.phase === "end") return false;
+  if (veilShowing()) return actorSide() !== stepReturn.active;
+  return actorSide() === stepReturn.active && myTurn();
+}
+
+function backToSkipped() {
+  if (!stepReturn || !state || !backVisible()) return;
+  const snap = stepReturn.snapshot;
+  stepReturn = null;
+  leaveAsk = null;
+  if (history.length && history[history.length - 1] === snap) history.pop();
+  clearMissionCelebration();
+  state = snap;
+  forgetUndoneResult(state);
+  const tab = ui.tab;
+  ui = freshUi();
+  ui.tab = tab;
+  ui.acked = actorSide();
+  render();
+}
+
+function backControl() {
+  if (!backVisible()) return "";
+  return `<div class="actions back-step"><button type="button" data-click="back-step">Back to ${esc(stepReturn.stepName)}</button></div>`;
+}
+
+function leaveHtml() {
+  if (!leaveAsk) return "";
+  const name = leaveAsk.stepName;
+  return `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="leave-title"><div class="modal-card leave-card">
+    <h2 id="leave-title">Leave ${esc(name)}?</h2>
+    <p>Leave ${esc(name)} without taking an action?</p>
+    <div class="actions">
+      <button type="button" class="primary" data-click="leave-yes">Yes, leave this step</button>
+      <button type="button" data-click="leave-no">No, stay</button>
+    </div>
+  </div></div>`;
+}
+
+function undoLast() {
+  if (setup.undo !== "on" || !history.length || !state) return;
+  clearMissionCelebration();
+  stepReturn = null;
+  leaveAsk = null;
+  state = history.pop();
+  forgetUndoneResult(state);
+  const tab = ui.tab;
+  ui = freshUi();
+  ui.tab = tab;
+  ui.acked = actorSide();
+  render();
+}
+
+function undoButton(extra = "") {
+  if (setup.undo !== "on" || !history.length) return "";
+  return `<button type="button" class="ghost ${extra}" data-click="undo" title="Undo the previous action">Undo</button>`;
+}
+
+function clearKillCelebration() {
+  window.clearTimeout(killTimer);
+  killTimer = 0;
+  killSerial += 1;
+  killToast = null;
+  killQueue = [];
+}
+
+function clearMissionCelebration() {
+  window.clearTimeout(missionTimer);
+  missionTimer = 0;
+  missionSerial += 1;
+  missionToast = null;
+  missionQueue = [];
+  clearKillCelebration();
+}
+
+function revealMission() {
+  window.clearTimeout(missionTimer);
+  missionToast = missionQueue.shift() || null;
+  if (!missionToast) return;
+  const serial = ++missionSerial;
+  missionTimer = window.setTimeout(() => {
+    if (serial !== missionSerial) return;
+    dismissMission();
+  }, 2000);
+}
+
+function dismissMission() {
+  window.clearTimeout(missionTimer);
+  missionTimer = 0;
+  missionSerial += 1;
+  missionToast = null;
+  if (killQueue.length && !killToast) revealKill();
+  else if (missionQueue.length) revealMission();
+  render();
+}
+
+function queueMissionCelebration(before, after) {
+  if (!after?.missionPulse) return;
+  const seen = new Set(before || []);
+  const fresh = [];
+  for (const pulse of after.missionPulse) {
+    const key = `${pulse.side}:${pulse.inst}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    fresh.push(pulse);
+  }
+  if (!fresh.length) return;
+  missionQueue.push(...fresh);
+  if (!missionToast && !killToast && !killQueue.length) revealMission();
+}
+
+function missionHtml() {
+  if (!missionToast) return "";
+  const pulse = missionToast;
+  return `<div class="mission-celebrate" data-click="mission-done" role="dialog" aria-label="Mission complete">
+    <div class="mission-stamp">
+      <p class="mission-kicker">${esc(labelSide(pulse.side))} · Mission complete</p>
+      <h3>${esc(pulse.title)}</h3>
+      <p class="mission-vp">+${pulse.vp} VP</p>
+      <p class="mission-dismiss">Click to continue</p>
+    </div>
+  </div>`;
+}
+
+function queueKillCelebration(before, after) {
+  const seen = new Set(before || []);
+  const fresh = [];
+  for (const note of after?.killPulse || []) {
+    if (seen.has(note.id)) continue;
+    seen.add(note.id);
+    fresh.push(note);
+  }
+  if (!fresh.length) return;
+  killQueue.push(...fresh);
+  if (!killToast && !missionToast) revealKill();
+}
+
+function revealKill() {
+  if (missionToast) return;
+  window.clearTimeout(killTimer);
+  killToast = killQueue.shift() || null;
+  if (!killToast) return;
+  const serial = ++killSerial;
+  killTimer = window.setTimeout(() => {
+    if (serial !== killSerial) return;
+    dismissKill();
+  }, 2000);
+}
+
+function dismissKill() {
+  window.clearTimeout(killTimer);
+  killTimer = 0;
+  killSerial += 1;
+  killToast = null;
+  if (killQueue.length) revealKill();
+  else if (missionQueue.length && !missionToast) revealMission();
+  render();
+}
+
+function killHtml() {
+  if (!killToast) return "";
+  const note = killToast;
+  return `<div class="kill-celebrate" data-click="kill-done" role="dialog" aria-label="${esc(note.text)}">
+    <div class="kill-stamp">
+      <p class="kill-line">${esc(note.text)}</p>
+      <p class="mission-dismiss">Click to continue</p>
+    </div>
+  </div>`;
+}
+
+function missionNote(side, mission) {
+  const deep = enemySideZones(side);
+  switch (mission.title) {
+    case "Hold in Cover": {
+      const held = controllerOf(state, "obj") === side;
+      const n = soldiersIn(state, "obj", { side, exposed: false }).length;
+      return held ? `${n} in cover on the objective` : "Objective not held";
+    }
+    case "Over the Top": {
+      const n = ["obj", ...deep].reduce((sum, zone) => sum + soldiersIn(state, zone, { side }).length, 0);
+      return `${n} / 3 soldiers forward`;
+    }
+    case "Guns Silenced":
+      return state.roundSupportKill[side] ? "Support weapon destroyed" : "No support weapon destroyed yet";
+    case "Tank Hunter":
+      return state.roundTankKill[side] ? "Tank destroyed" : "No tank destroyed yet";
+    case "No Shelter":
+      return `${state.players[side].destroyedCover.length} / 3 cover destroyed`;
+    case "Deep Push":
+      return `${deep.filter((z) => controllerOf(state, z) === side).length} / 2 enemy zones`;
+    case "Shock Action":
+      return state.roundBurst[side] ? "Three fell to one attack" : "Need 3 eliminations in one attack";
+    case "In the Wire": {
+      const n = Math.max(0, ...deep.map((z) => soldiersIn(state, z, { side }).length));
+      return `${n} / 4 in one enemy zone`;
+    }
+    case "Dug In": {
+      const n = BATTLEFIELD.reduce((sum, z) => sum + soldiersIn(state, z, { side, exposed: false }).length, 0);
+      return `${n} / 3 in cover · scores when the round ends`;
+    }
+    case "Breakthrough": {
+      const obj = controllerOf(state, "obj") === side;
+      const foot = deep.some((z) => controllerOf(state, z) === side);
+      return `${obj ? "Holds the objective" : "Need the objective"} · ${foot ? "inside enemy ground" : "need an enemy zone"}`;
+    }
+    case "Attrition":
+      return `${state.roundElim[side] || 0} / 5 eliminated this round`;
+    default:
+      return "";
+  }
+}
+
+function countAt(side, loc) {
+  return state.soldiers.filter((s) => s.owner === side && s.loc === loc).length;
+}
+
+function renderZone(id) {
+  const ukAll = state.soldiers.filter((s) => s.loc === id && s.owner === "uk");
+  const deAll = state.soldiers.filter((s) => s.loc === id && s.owner === "de");
+  const uk = ukAll.filter((s) => !s.coverId);
+  const de = deAll.filter((s) => !s.coverId);
+  const covers = coversIn(state, id);
+  const gear = state.equipment.filter((u) => u.loc === id);
+  const ground = id === "obj" ? "obj" : id.startsWith("uk") ? "uk-ground" : id.startsWith("de") ? "de-ground" : "";
+  const classes = ["zone", ground, id.includes("Trench") ? "trench" : "", ui.zone === id ? "picked" : "", legalZones().includes(id) ? "legal" : "", state.effects.smoke.includes(id) ? "smoke" : ""];
+  let ctrl = "";
+  if (isBattlefield(id)) {
+    if (isContested(state, id)) ctrl = "<em>Contested</em>tank on the field";
+    else if (controllerOf(state, id)) ctrl = `<em>${labelSide(controllerOf(state, id))}</em>control`;
+    else ctrl = "<em>Open</em>no control";
+  } else {
+    const side = id.startsWith("uk") ? "uk" : "de";
+    ctrl = `<em>${countAt(side, id)} / 5</em>in the trench`;
+  }
+  const smoke = state.effects.smoke.includes(id) ? `<span class="zone-meta">Smoke screen</span>` : "";
+  return `<div class="${classes.filter(Boolean).join(" ")}" data-click="zone" data-id="${id}">
+    <div class="zone-name"><strong>${esc(ZONE_LABELS[id])}</strong>${ukAll.length || deAll.length ? `${ukAll.length} British · ${deAll.length} German` : "Empty"}${smoke}</div>
+    <div class="zone-body">${uk.map((s) => soldierButton(s)).join("")}${covers.map(coverButton).join("")}${gear.map(unitButton).join("")}${de.map((s) => soldierButton(s)).join("")}</div>
+    <div class="zone-ctrl">${ctrl}</div>
+  </div>`;
+}
+
+function allocMark(id) {
+  const pending = state.pending;
+  if (pending?.type !== "allocate-hits") return { on: false, count: 0 };
+  const count = (ui.allocStack || []).filter((hit) => hit === id).length;
+  return { on: pending.options.some((option) => option.id === id), count };
+}
+
+function soldierButton(soldier, inCover = false) {
+  const selected = ui.soldiers.includes(soldier.id) ? "selected" : "";
+  const targeted = ui.enemy === soldier.id ? "targeted" : "";
+  const used = state.players[soldier.owner].attackedIds.includes(soldier.id) ? "used" : "";
+  const mark = allocMark(soldier.id);
+  const title = `${labelSide(soldier.owner)} soldier, ${inCover ? "in this cover" : "exposed"}${mark.count ? `, ${mark.count} hit${mark.count === 1 ? "" : "s"} assigned` : ""}`;
+  return `<button type="button" class="token ${soldier.owner} ${selected} ${targeted} ${used} ${mark.on ? "alloc" : ""} ${inCover ? "nested" : ""}" data-click="soldier" data-id="${soldier.id}" aria-label="${esc(title)}" title="${esc(title)}">${helmet(soldier.owner)}</button>`;
+}
+
+function coverButton(cover) {
+  const selected = ui.cover === cover.id ? "selected" : "";
+  const occ = soldiersIn(state, cover.loc, { matchCover: true, coverId: cover.id });
+  const value = cover.revealed ? String(cover.defense) : "?";
+  const mark = allocMark(cover.id);
+  const title = `Cover ${cover.revealed ? "defense " + cover.defense : "unrevealed"}, ${occ.length} inside${mark.count ? `, ${mark.count} hits assigned` : ""}`;
+  const count = occ.length
+    ? `<button type="button" class="cover-count" data-click="cover" data-id="${cover.id}" aria-label="${occ.length} in this cover">${occ.length}</button>`
+    : "";
+  return `<div class="dugout ${occ.length ? "held" : ""}">
+    <button type="button" class="cover ${cover.revealed ? "open" : ""} ${selected} ${mark.on ? "alloc" : ""}" data-click="cover" data-id="${cover.id}" aria-label="${esc(title)}" title="${esc(title)}"><img src="assets/cover-token.jpg" alt="" draggable="false"><b>${value}</b></button>
+    <div class="occupants">${occ.map((s) => soldierButton(s, true)).join("")}</div>
+    ${count}
+  </div>`;
+}
+
+function unitSrc(type, side) {
+  if (type === "tank") return side === "de" ? "assets/tank-german.png" : "assets/tank-british.png";
+  if (type === "mortar") return "assets/mortar.png";
+  return "assets/machine-gun.png";
+}
+
+function unitButton(unit) {
+  const selected = ui.unit === unit.id ? "selected" : "";
+  const targeted = ui.targetUnit === unit.id ? "targeted" : "";
+  const used = state.players[unit.owner].attackedIds.includes(unit.id) ? "used" : "";
+  const dmg = unit.damage ? `<small>${unit.damage}</small>` : "";
+  const name = capType(unit.type);
+  const mark = allocMark(unit.id);
+  const title = `${labelSide(unit.owner)} ${name}${unit.damage ? `, ${unit.damage} damage` : ""}${mark.count ? `, ${mark.count} hits assigned` : ""}`;
+  return `<button type="button" class="unit ${unit.type} ${unit.owner} ${selected} ${targeted} ${used} ${mark.on ? "alloc" : ""}" data-click="unit" data-id="${unit.id}" aria-label="${esc(title)}" title="${esc(title)}"><img src="${unitSrc(unit.type, unit.owner)}" alt="" draggable="false">${dmg}</button>`;
+}
+
+function chargeSelection(me) {
+  const picked = ui.soldiers
+    .map((id) => state.soldiers.find((s) => s.id === id && s.owner === me))
+    .filter(Boolean);
+  if (!picked.length || picked.some((s) => s.loc !== picked[0].loc)) return null;
+  return picked.slice(0, 3);
+}
+
+function legalZones() {
+  const me = viewer();
+  if (!myTurn()) return [];
+  if (state.actionStep === "event") {
+    const card = selectedCard();
+    const picked = chargeSelection(me);
+    if (!picked) return [];
+    if (card?.title === "Bayonet Charge") return bayonetDestinations(state, me, picked[0].loc);
+    if (card?.title === "Charge" && isBattlefield(picked[0].loc)) {
+      const dest = stepZone(me, picked[0].loc, "forward");
+      return dest && isBattlefield(dest) ? [dest] : [];
+    }
+    return [];
+  }
+  if (state.actionStep !== "move") return [];
+  const soldier = state.soldiers.find((s) => s.id === ui.soldiers[0] && s.owner === me);
+  const unit = state.equipment.find((u) => u.id === ui.unit && u.owner === me && u.type !== "tank");
+  const piece = soldier || unit;
+  if (!piece) return [];
+  return ["forward", "back"].map((dir) => stepZone(me, piece.loc, dir)).filter((zone) => zone && isBattlefield(zone));
+}
+
+function spentDieIndexes(side) {
+  const player = state.players[side];
+  const used = new Set();
+  if (!player?.committed) return used;
+  const left = { ...(player.spent || {}) };
+  for (const rawIndex of player.spentDice || []) {
+    const index = Number(rawIndex);
+    if (!Number.isInteger(index) || used.has(index)) continue;
+    used.add(index);
+    const face = player.dice[index];
+    const effective = face === "wild" ? player.wildAs : face;
+    if (effective && (left[effective] || 0) > 0) left[effective] -= 1;
+  }
+  const order = [];
+  player.dice.forEach((face, index) => {
+    if (!face || used.has(index)) return;
+    const effective = face === "wild" ? player.wildAs : face;
+    if (!effective || effective === "wild") return;
+    order.push({ index, effective, wild: face === "wild" });
+  });
+  order.sort((a, b) => Number(a.wild) - Number(b.wild) || a.index - b.index);
+  for (const die of order) {
+    if ((left[die.effective] || 0) > 0) {
+      used.add(die.index);
+      left[die.effective] -= 1;
+    }
+  }
+  return used;
+}
+
+function bayonetChoice(side, index) {
+  const player = state.players[side];
+  if (!player || spentDieIndexes(side).has(index)) return false;
+  const face = player.dice[index];
+  if (!face) return false;
+  const effective = face === "wild" ? player.wildAs : face;
+  return effective === "bayonet";
+}
+
+function selectedBayonetIndexes(side) {
+  return [...new Set(ui.dice.map((index) => Number(index)))]
+    .filter((index) => bayonetChoice(side, index))
+    .sort((a, b) => a - b);
+}
+
+function dieButton(side, face, index) {
+  const player = state.players[side];
+  const mine = side === viewer() && myTurn();
+  const reroll = mine && state.phase === "reroll";
+  const go = mine && state.pending?.type === "generals-order" && ui.order === "yes";
+  const sabotage = mine && state.actionStep === "event" && selectedCard()?.title === "Sabotage" && side !== viewer();
+  const spent = spentDieIndexes(side).has(index);
+  const deployPick = mine && state.phase === "action" && state.actionStep === "deploy" && bayonetChoice(side, index);
+  const picked = deployPick && ui.dice.map(Number).includes(index);
+  const classes = ["die", side, face ? "" : "drop"];
+  if (spent) classes.push("spent");
+  if (deployPick) classes.push("choice");
+  if (picked) classes.push("picked");
+  if (reroll && player.kept[index] === false) classes.push("drop");
+  if (go && ui.dice.includes(index)) classes.push("go");
+  if (sabotage && ui.dieIndex === index) classes.push("go");
+  const display = face === "wild" && player.committed && player.wildAs ? player.wildAs : face;
+  const shown = FACE_LABEL[display] || "Spent";
+  const enabled = Boolean(face) && (reroll || go || sabotage || deployPick);
+  const title = spent ? "Used" : picked ? "Selected to spend" : deployPick ? "Select this bayonet" : display === "shovel" ? "Dig one soldier into cover" : "";
+  return `<button type="button" class="${classes.filter(Boolean).join(" ")}" data-click="die" data-side="${side}" data-index="${index}" ${title ? `title="${title}"` : ""} ${picked ? `aria-pressed="true"` : ""} ${enabled ? "" : "disabled"}>${display ? faceSvg(display) : ""}<span>${esc(shown)}</span></button>`;
+}
+
+function selectedCard() {
+  const me = viewer();
+  if (!me) return null;
+  return state.players[me].eventHand.find((c) => c.inst === ui.card) || null;
+}
+
+function poolText(side) {
+  if (!state.players[side].committed) return "";
+  const bits = FACES.filter((f) => f !== "wild").map((f) => `${FACE_LABEL[f]} ${Math.max(0, remaining(state, side, f))}`);
+  const stolen = state.effects.stolenDie;
+  if (stolen?.owner === side) bits.push(`stolen ${stolen.face}`);
+  return bits.join(" · ");
+}
+
+function promptText() {
+  const me = viewer();
+  const name = labelSide(me);
+  if (state.pending?.type === "spotter") {
+    return "Your spotter rolled the mortar die twice. Choose a zone. The mortar then places 1 hit on an eligible target there. It cannot strike the Objective.";
+  }
+  if (state.pending?.type === "mortar-target") {
+    return `The mortar die struck ${ZONE_LABELS[state.pending.zone]}. Place its 1 hit before cover defense is revealed.`;
+  }
+  if (state.pending?.type === "allocate-hits") {
+    const pending = state.pending;
+    const stacking = pending.options.length > 1;
+    const remain = stacking ? pending.hits - (ui.allocStack || []).length : pending.hits;
+    const place = ZONE_LABELS[pending.zone] || "the target";
+    if (!stacking) {
+      const only = pending.options[0];
+      return `Hits remaining: ${remain}. ${only ? only.label : place} is the only legal target. Confirm to assign ${pending.hits === 1 ? "the hit" : "every hit"}.`;
+    }
+    return `Hits remaining: ${remain}. The attack on ${place} rolled ${pending.hits} hit${pending.hits === 1 ? "" : "s"}. Click a target to assign a hit. Click that target again to take the hit off.`;
+  }
+  if (state.pending?.type === "gambit" && state.pending.stage === "keep") {
+    return "Mission Gambit: keep one of these two Missions. The other goes to the bottom of the deck. Your five dice stay available.";
+  }
+  if (state.pending?.type === "gambit") {
+    return "You may discard one Mission you already hold and draw a replacement. Then the hand is trimmed to 5.";
+  }
+  if (state.pending?.type === "generals-order") {
+    if (ui.order !== "yes") {
+      return `${name} holds General's Order. Play it before initiative is fixed? It can reroll up to 2 of these dice, or change 1 die to a face already showing. Initiative is then read from this roll, ignoring wilds. Roll 2 and Roll 3 still come afterward and can reroll any number of dice.`;
+    }
+    return "Select up to 2 dice to reroll, or select 1 die and change it to a face already showing.";
+  }
+  if (state.phase === "reroll") {
+    const side = state.active || me;
+    const name = labelSide(side);
+    const used = state.players[side].rollsUsed;
+    const left = Math.max(0, 3 - used);
+    const fixed = state.initiative?.tieRolls ? "the deciding roll" : "Roll 1";
+    const order = side === state.player1
+      ? `${name} won initiative, so ${name} shapes these dice second and acts first.`
+      : `${name} lost initiative, so ${name} shapes these dice first and acts second.`;
+    if (left > 0) {
+      return `Reroll ${name}'s dice. ${order} Initiative was fixed on ${fixed} and will not change. Roll ${used + 1}: click any of ${name}'s dice to reroll them. Any number is allowed, including dice kept earlier. ${left} reroll${left === 1 ? "" : "s"} left.`;
+    }
+    return `${name}'s dice are ready to commit. Initiative was fixed on ${fixed} and will not change. ${name} has no rerolls left.`;
+  }
+  const hints = {
+    shock: "Five matching dice. Mustard Gas spends all five. Hits eliminate exposed enemy soldiers in their Zones 1, 2, and 3. Mission Gambit draws missions and keeps the five dice for normal actions.",
+    tank: "Each tank on the field may advance one or two zones. Moving one does not spend the others. A tank stops if it meets an enemy tank, and neither tank can leave while both remain. Driving into the enemy trench scores 3 VP and returns the tank to supply.",
+    event: "Choose an Event, then the soldiers, zone, or weapon it asks for. Each Event costs one Whistle. General's Order cannot be played now.",
+    deploy: "Select the bayonet dice to spend. One deploys a soldier from supply into a zone you control, once this round, or repairs one damage. Two deploys a mortar into Zone 1 if you control it and a mortar remains in supply. Three deploys a machine gun onto a zone you control on your side if a machine gun remains in supply. Four deploys a tank into Zone 1 if a tank remains in supply.",
+    move: "Select one soldier or support weapon, then advance or fall back a single zone. A Boot also advances one of your trench soldiers into Zone 1. A soldier in cover must spend a Shovel to leave before the Boot.",
+    cover: "A Shovel digs one exposed soldier into cover in the same zone. Select the soldier. Cover holds three of your soldiers and hides its defense until fired on, scouted, or reconnoitered.",
+    attack: "Soldiers in cover can fire and can be targeted. Select your soldiers or a weapon, then a target. Soldiers and a machine gun that can each reach the same target fire together and add their dice, while mortars and tanks shoot on their own. Each attack die is 3 Hit and 3 Miss. Soldiers roll 1 and shoot one zone. Machine guns roll 3, or 4 at the objective, out to two zones, and cannot shoot tanks. Tanks roll 3 at an adjacent zone or overrun cover beneath them. Each unit attacks once. After soldiers, a machine gun, or a tank roll hits, you assign those hits to the legal targets.",
+  };
+  if (state.phase === "action" && state.actionStep === "deploy") {
+    const bayonets = remaining(state, me, "bayonet");
+    const selected = selectedBayonetIndexes(me).length;
+    const picked = selected ? ` ${selected} selected.` : "";
+    const mortarsLeft = mortarsInSupply(state, me);
+    const gunsLeft = machineGunsInSupply(state, me);
+    const tanksLeft = tanksInSupply(state, me);
+    return `${hints.deploy} You have ${bayonets} bayonet${bayonets === 1 ? "" : "s"}.${picked} Mortars left in supply: ${mortarsLeft}. Machine guns left in supply: ${gunsLeft}. Tanks left in supply: ${tanksLeft}.`;
+  }
+  if (state.phase === "action") return hints[state.actionStep] || "";
+  if (state.phase === "regroup") {
+    const p = state.players[me];
+    const left = Math.max(0, 2 - (p.regroupExchanged || 0));
+    if (!p.regroupDrew) return `Draw one Event from the display or the deck. You may also exchange up to ${left} unused die${left === 1 ? "" : " faces"} for Soldiers in the Trench.`;
+    return left ? `${left} die exchange${left === 1 ? "" : "s"} still available. End regroup when you are finished.` : "End regroup to finish the round.";
+  }
+  return "";
+}
+
+function phaseTitle() {
+  const me = viewer();
+  if (state.phase === "end") return "Battle over";
+  if (state.pending?.type === "generals-order") return `${labelSide(me)} · General's Order`;
+  if (state.pending?.type === "spotter") return `${labelSide(me)} · Spotter`;
+  if (state.pending?.type === "gambit") return `${labelSide(me)} · Mission Gambit`;
+  if (state.pending?.type === "mortar-target") return `${labelSide(me)} · Mortar`;
+  if (state.phase === "reroll") return `Reroll ${labelSide(state.active || me)}'s dice`;
+  if (state.phase === "regroup") return `${labelSide(me)} · Regroup`;
+  const step = STEPS.find(([id]) => id === state.actionStep);
+  return `${labelSide(me)} · ${step ? step[1] : "Action"}`;
+}
+
+function allocTarget(id) {
+  return state.pending?.type === "allocate-hits" && state.pending.options.some((option) => option.id === id);
+}
+
+function addAllocHit(id) {
+  const pending = state.pending;
+  if (!allocTarget(id)) return;
+  const stack = ui.allocStack || [];
+  if (stack.length >= pending.hits) return;
+  ui.allocStack = [...stack, id];
+  render();
+}
+
+function clickAllocTarget(id) {
+  if (!allocTarget(id)) return;
+  const stack = ui.allocStack || [];
+  const count = stack.filter((hit) => hit === id).length;
+  if (count > 0) {
+    const next = stack.slice();
+    next.splice(next.lastIndexOf(id), 1);
+    ui.allocStack = next;
+  } else if (stack.length < state.pending.hits) {
+    ui.allocStack = [...stack, id];
+  }
+  render();
+}
+
+function hitAllocationButtons() {
+  const pending = state.pending;
+  const options = pending.options || [];
+  const stack = ui.allocStack || [];
+  const stacking = options.length > 1;
+  const remain = stacking ? pending.hits - stack.length : pending.hits;
+  attackHint = `Hits remaining: ${remain}.`;
+  if (!stacking) {
+    const only = options[0];
+    return [{
+      label: only ? `Confirm ${pending.hits} hit${pending.hits === 1 ? "" : "s"} on ${only.label}` : "Confirm hits",
+      primary: true,
+      run: () => commit({ type: "ALLOCATE_HITS", picks: Array(pending.hits).fill(only.id) }),
+    }];
+  }
+  const list = [];
+  for (const option of options) {
+    const count = stack.filter((id) => id === option.id).length;
+    list.push({
+      label: count ? `${option.label} · ${count} hit${count === 1 ? "" : "s"}` : option.label,
+      run: () => clickAllocTarget(option.id),
+    });
+    if (count > 0 && remain > 0) {
+      list.push({
+        label: `Another hit on ${option.label}`,
+        run: () => addAllocHit(option.id),
+      });
+    }
+  }
+  if (allocationReady(pending, stack)) {
+    list.push({
+      label: remain ? `Confirm hits · ${remain} left over` : "Confirm hits",
+      primary: true,
+      run: () => commit({ type: "ALLOCATE_HITS", picks: stack.slice() }),
+    });
+  }
+  return list;
+}
+
+function actionList() {
+  attackHint = "";
+  deployNote = "";
+  if (!myTurn()) return [];
+  const me = viewer();
+  if (state.pending?.type === "spotter") {
+    return state.pending.options.map((face) => ({
+      label: mortarName(me, face),
+      primary: true,
+      run: () => commit({ type: "PICK_SPOTTER", face }),
+    }));
+  }
+  if (state.pending?.type === "mortar-target") {
+    return state.pending.options.map((option) => ({
+      label: `1 hit on ${option.label}`,
+      primary: option.kind === "exposed",
+      run: () => commit({ type: "ALLOCATE_MORTAR", targetId: option.id }),
+    }));
+  }
+  if (state.pending?.type === "allocate-hits") return hitAllocationButtons();
+  if (state.pending?.type === "gambit" && state.pending.stage === "keep") {
+    return state.pending.cards.map((card) => ({
+      label: `Keep ${card.title} (${card.vp} VP)`,
+      hint: cardBlurb(card),
+      primary: true,
+      run: () => commit({ type: "PICK_GAMBIT", inst: card.inst }),
+    }));
+  }
+  if (state.pending?.type === "gambit") {
+    const list = state.players[me].missionHand.map((card) => ({
+      label: `Swap ${card.title}`,
+      hint: cardBlurb(card),
+      run: () => commit({ type: "FINISH_GAMBIT", discard: card.inst }),
+    }));
+    list.push({ label: "Keep these missions", primary: true, run: () => commit({ type: "FINISH_GAMBIT" }) });
+    return list;
+  }
+  if (state.pending?.type === "generals-order") return generalsButtons(me);
+  if (state.phase === "reroll") return rerollButtons(me);
+  if (state.phase === "regroup") return regroupButtons(me);
+  if (state.phase !== "action") return [];
+  if (state.actionStep === "shock") {
+    return [
+      { label: "Mustard Gas", primary: true, run: () => commit({ type: "SHOCK", option: "gas" }) },
+      { label: "Mission Gambit", run: () => commit({ type: "SHOCK", option: "gambit" }) },
+      { label: "Decline the Shock", run: () => askLeave({ type: "SKIP_SHOCK" }) },
+    ];
+  }
+  if (state.actionStep === "tank") return tankButtons(me);
+  if (state.actionStep === "event") return eventButtons(me);
+  if (state.actionStep === "deploy") return deployButtons(me);
+  if (state.actionStep === "move") return moveButtons(me);
+  if (state.actionStep === "cover") return coverButtons(me);
+  if (state.actionStep === "attack") return attackButtons(me);
+  return [];
+}
+
+function generalsButtons(me) {
+  if (ui.order !== "yes") {
+    return [
+      { label: "Yes, use General's Order", primary: true, run: () => { ui.order = "yes"; ui.dice = []; render(); } },
+      { label: "No, keep the roll", run: () => commit({ type: "SKIP_GENERALS_ORDER" }) },
+    ];
+  }
+  const faces = [...new Set(state.players[me].dice.filter((f) => f && f !== "wild"))];
+  const list = [
+    {
+      label: ui.dice.length ? `Reroll ${ui.dice.length} selected` : "Reroll selected dice",
+      primary: true,
+      run: () => commit({ type: "GENERALS_ORDER", side: me, mode: "reroll", indexes: ui.dice.slice(0, 2) }),
+    },
+  ];
+  if (ui.dice.length) {
+    for (const face of faces) {
+      list.push({
+        label: `Change die ${ui.dice[0] + 1} to ${FACE_LABEL[face]}`,
+        run: () => commit({ type: "GENERALS_ORDER", side: me, mode: "change", index: ui.dice[0], to: face }),
+      });
+    }
+  }
+  list.push({ label: "Keep the roll", run: () => commit({ type: "SKIP_GENERALS_ORDER" }) });
+  return list;
+}
+
+function rerollButtons(me) {
+  const player = state.players[me];
+  const list = [];
+  const choices = ["boot", "whistle", "shovel", "bayonet"].filter((f) => naturalFaces(player.dice).includes(f));
+  const wildAs = choices.includes(ui.wildAs) ? ui.wildAs : null;
+  if (player.rollsUsed < 3) {
+    const marked = player.kept.filter((k) => !k).length;
+    list.push({
+      label: marked ? `Reroll selected (${marked})` : "Reroll selected",
+      primary: marked > 0,
+      run: () => commit({ type: "REROLL" }),
+    });
+    list.push({
+      label: "Keep the roll",
+      primary: marked === 0,
+      run: () => commit({ type: "COMMIT", wildAs }),
+    });
+  }
+  if (hasWildFace(player.dice)) {
+    list.push({
+      label: wildAs ? `Commit · Wilds as ${FACE_LABEL[wildAs]}` : "Commit dice",
+      primary: player.rollsUsed >= 3,
+      run: () => commit({ type: "COMMIT", wildAs }),
+    });
+  }
+  return list;
+}
+
+function regroupButtons(me) {
+  const p = state.players[me];
+  const list = [];
+  const trench = state.soldiers.filter((s) => s.owner === me && s.loc === ownTrench(me)).length;
+  const available = state.soldiers.some((s) => s.owner === me && s.loc === "available");
+  if ((p.regroupExchanged || 0) < 2 && unusedDice(state, me) > 0 && trench < 5 && available) {
+    list.push({
+      label: `Exchange 1 die for a Soldier (${p.regroupExchanged || 0}/2)`,
+      primary: true,
+      run: () => commit({ type: "REGROUP_EXCHANGE" }),
+    });
+  }
+  if (!p.regroupDrew && p.eventHand.length < 7) {
+    for (const card of state.eventDisplay) {
+      list.push({
+        label: `Draw ${card.title}`,
+        hint: cardBlurb(card),
+        primary: !list.length,
+        run: () => commit({ type: "REGROUP_DRAW", side: me, source: card.inst }),
+      });
+    }
+    if (state.eventDeck.length) list.push({ label: "Blind draw", run: () => commit({ type: "REGROUP_DRAW", side: me, source: "deck" }) });
+  }
+  list.push({ label: "End regroup", run: () => commit({ type: "SKIP_REGROUP" }) });
+  return list;
+}
+
+function tanksReady(me) {
+  return tanksReadyToMove(state, me);
+}
+
+function tankButtons(me) {
+  const tanks = tanksReady(me);
+  const list = [];
+  const many = tanks.length > 1;
+  for (const tank of tanks) {
+    const where = ZONE_LABELS[tank.loc];
+    const sharing = tanks.filter((other) => other.loc === tank.loc);
+    const which = !many
+      ? ""
+      : sharing.length > 1
+        ? ` (${where}, tank ${sharing.findIndex((other) => other.id === tank.id) + 1})`
+        : ` (${where})`;
+    list.push({
+      label: `Advance 1 zone${which}`,
+      primary: list.length === 0,
+      run: () => commit({ type: "MOVE_TANK", unitId: tank.id, steps: 1 }),
+    });
+    list.push({
+      label: `Advance 2 zones${which}`,
+      run: () => commit({ type: "MOVE_TANK", unitId: tank.id, steps: 2 }),
+    });
+  }
+  list.push({ label: "Hold the tank", run: () => askLeave({ type: "SKIP_TANK" }) });
+  return list;
+}
+
+function grantedMoveButtons(me, card) {
+  const picked = chargeSelection(me);
+  if (!picked) return [];
+  if (card.title === "Bayonet Charge") {
+    return bayonetDestinations(state, me, picked[0].loc).map((dest, index) => ({
+      label: `Charge into ${ZONE_LABELS[dest]}`,
+      hint: cardBlurb(card),
+      primary: index === 0,
+      run: () => commit({
+        type: "PLAY_EVENT",
+        cardInst: card.inst,
+        params: { ...eventParams(), soldierIds: picked.map((s) => s.id), zone: dest },
+      }),
+    }));
+  }
+  if (card.title !== "Charge" || !isBattlefield(picked[0].loc)) return [];
+  const dest = stepZone(me, picked[0].loc, "forward");
+  if (!dest || !isBattlefield(dest)) return [];
+  return [{
+    label: `Move into ${ZONE_LABELS[dest]}`,
+    hint: cardBlurb(card),
+    primary: true,
+    run: () => commit({
+      type: "PLAY_EVENT",
+      cardInst: card.inst,
+      params: { ...eventParams(), soldierIds: picked.map((s) => s.id), zone: dest, dir: "forward" },
+    }),
+  }];
+}
+
+function eventButtons(me) {
+  const card = selectedCard();
+  const list = [];
+  if (card && card.title !== "General's Order") {
+    const opened = state.players[me].eventsAtStep;
+    if (!opened || opened.includes(card.inst)) {
+      const moves = grantedMoveButtons(me, card);
+      if (moves.length) list.push(...moves);
+      else list.push({ label: `Play ${card.title}`, hint: cardBlurb(card), primary: true, run: () => commit({ type: "PLAY_EVENT", cardInst: card.inst, params: eventParams() }) });
+    }
+  }
+  list.push({ label: "Done with events", run: () => askLeave({ type: "SKIP_EVENT" }) });
+  return list;
+}
+
+function eventParams() {
+  const card = selectedCard();
+  const params = {
+    soldierIds: ui.soldiers,
+    zone: ui.zone,
+    coverId: ui.cover,
+    unitId: ui.unit,
+    soldierId: ui.enemy,
+    dieIndex: ui.dieIndex,
+    dir: ui.dir,
+    supportType: ui.supportType,
+    targetKind: ui.targetKind || "exposed",
+  };
+  if (card && (card.title === "Heavy Barrage" || card.title === "Bombing Run")) {
+    if (ui.targetKind === "cover") params.targetKind = "cover";
+    else if (ui.targetKind === "unit" && ui.targetUnit) {
+      const unit = state.equipment.find((u) => u.id === ui.targetUnit);
+      params.targetKind = unit?.type || "mg";
+      params.unitId = ui.targetUnit;
+      params.zone = unit?.loc || ui.zone;
+    } else params.targetKind = "exposed";
+  }
+  if (card?.title === "Charge") params.dir = "forward";
+  if (card?.title === "Bayonet Charge") {
+    const me = viewer();
+    const picked = (params.soldierIds || [])
+      .map((id) => state.soldiers.find((s) => s.id === id && s.owner === me))
+      .filter(Boolean)
+      .slice(0, 3);
+    const origin = picked[0]?.loc;
+    if (origin && picked.every((s) => s.loc === origin)) {
+      params.soldierIds = picked.map((s) => s.id);
+      const options = bayonetDestinations(state, me, origin);
+      if (options.length && !options.includes(params.zone)) {
+        const forward = stepZone(me, origin, "forward");
+        params.zone = options.includes(forward) ? forward : options[0];
+      }
+    }
+  }
+  return params;
+}
+
+function deployButtons(me) {
+  const indexes = selectedBayonetIndexes(me);
+  const n = indexes.length;
+  const list = [];
+  deployNote = "";
+  if (n === 1) {
+    const soldierReady = !state.players[me].soldierDeployed && state.soldiers.some((s) => s.owner === me && s.loc === "available");
+    const zones = soldierReady ? [...sideZones(me), "obj", ...enemySideZones(me)].filter((zone) => controllerOf(state, zone) === me) : [];
+    for (const zone of zones) {
+      list.push({
+        label: `Deploy a Soldier in ${ZONE_LABELS[zone]} (1)`,
+        primary: list.length === 0,
+        run: () => commit({ type: "DEPLOY", kind: "soldier", zone, indexes }),
+      });
+    }
+    for (const unit of state.equipment) {
+      if (unit.owner === me && isBattlefield(unit.loc) && unit.damage >= 1) {
+        list.push({
+          label: `Repair ${capType(unit.type)} (${unit.damage})`,
+          primary: list.length === 0,
+          run: () => commit({ type: "REPAIR", unitId: unit.id, indexes }),
+        });
+      }
+    }
+    if (!list.length) {
+      if (state.players[me].soldierDeployed) deployNote = "You already deployed a soldier this round.";
+      else if (!state.soldiers.some((s) => s.owner === me && s.loc === "available")) deployNote = "No soldier in supply.";
+      else deployNote = "No battlefield zone you control.";
+    }
+  } else if (n === 2) {
+    const zone = ownZone1(me);
+    if (canDeployMortar(state, me)) {
+      list.push({
+        label: "Deploy mortar into Zone 1",
+        primary: true,
+        run: () => commit({ type: "DEPLOY", kind: "mortar", zone, indexes }),
+      });
+    } else if (mortarsInSupply(state, me) <= 0) {
+      deployNote = "The mortars are all deployed.";
+    } else {
+      deployNote = "You do not control Zone 1.";
+    }
+  } else if (n === 3) {
+    const zones = machineGunsInSupply(state, me) > 0 ? sideZones(me).filter((zone) => controllerOf(state, zone) === me) : [];
+    for (const zone of zones) {
+      list.push({
+        label: `Deploy machine gun in ${ZONE_LABELS[zone]} (3)`,
+        primary: list.length === 0,
+        run: () => commit({ type: "DEPLOY", kind: "mg", zone, indexes }),
+      });
+    }
+    if (!list.length) {
+      deployNote = machineGunsInSupply(state, me) <= 0 ? "The machine guns are all deployed." : "No zone you control on your side.";
+    }
+  } else if (n === 4) {
+    if (tanksInSupply(state, me) > 0) {
+      list.push({
+        label: "Deploy tank into Zone 1 (4)",
+        primary: true,
+        run: () => commit({ type: "DEPLOY", kind: "tank", indexes }),
+      });
+    } else {
+      deployNote = "The tanks are all deployed.";
+    }
+  } else if (n > 4) {
+    deployNote = "No deployment costs that many bayonets.";
+  }
+  list.push({ label: "Done deploying", primary: list.length === 0, run: () => askLeave({ type: "SKIP_DEPLOY" }) });
+  return list;
+}
+
+function moveButtons(me) {
+  const list = [];
+  const soldier = state.soldiers.find((s) => s.id === ui.soldiers[0] && s.owner === me);
+  if (soldier && soldier.loc === ownTrench(me) && !soldier.coverId && remaining(state, me, "boot") >= 1) {
+    const dest = stepZone(me, soldier.loc, "forward");
+    if (dest === ownZone1(me)) {
+      list.push({
+        label: "Advance to Zone 1 (1 boot)",
+        primary: true,
+        run: () => commit({ type: "MOVE_UNIT", kind: "soldier", unitId: soldier.id, dir: "forward" }),
+      });
+    }
+  } else if (soldier && isBattlefield(soldier.loc)) {
+    for (const dir of ["forward", "back"]) {
+      const dest = stepZone(me, soldier.loc, dir);
+      if (!dest || !isBattlefield(dest)) continue;
+      const cost = soldier.coverId ? "1 shovel, then 1 boot" : "1 boot";
+      list.push({
+        label: `${dir === "forward" ? "Advance" : "Fall back"} to ${ZONE_LABELS[dest]} (${cost})`,
+        primary: dir === "forward",
+        run: () => commit(soldier.coverId
+          ? { type: "LEAVE_COVER_THEN_MOVE", unitId: soldier.id, dir, kind: "soldier" }
+          : { type: "MOVE_UNIT", kind: "soldier", unitId: soldier.id, dir }),
+      });
+    }
+  }
+  const unit = state.equipment.find((u) => u.id === ui.unit && u.owner === me && u.type !== "tank");
+  if (unit && isBattlefield(unit.loc)) {
+    for (const dir of ["forward", "back"]) {
+      const dest = stepZone(me, unit.loc, dir);
+      if (!dest || !isBattlefield(dest)) continue;
+      list.push({
+        label: `Move ${capType(unit.type)} to ${ZONE_LABELS[dest]}`,
+        run: () => commit({ type: "MOVE_UNIT", kind: "weapon", unitId: unit.id, dir }),
+      });
+    }
+  }
+  list.push({ label: "Done moving", primary: list.length === 0, run: () => askLeave({ type: "SKIP_MOVE" }) });
+  return list;
+}
+
+function coverFits(me, soldier, cover) {
+  if (!soldier || soldier.coverId || !cover || cover.destroyed) return false;
+  if (!isBattlefield(soldier.loc) || soldier.loc !== cover.loc) return false;
+  const occ = soldiersIn(state, cover.loc, { matchCover: true, coverId: cover.id });
+  return occ.length < 3 && !occ.some((o) => o.owner !== me);
+}
+
+function coverButtons(me) {
+  const list = [];
+  const soldier = state.soldiers.find((s) => s.id === ui.soldiers[0] && s.owner === me);
+  const cover = state.covers.find((c) => c.id === ui.cover && !c.destroyed);
+  const inZone = soldier ? state.covers.filter((c) => coverFits(me, soldier, c)) : [];
+  const targets = cover && coverFits(me, soldier, cover) ? [cover] : inZone;
+  targets.forEach((token, i) => {
+    const occ = soldiersIn(state, token.loc, { matchCover: true, coverId: token.id }).length;
+    const label = targets.length > 1 ? `Dig into cover ${token.revealed ? token.defense : "?"} (${occ}/3)` : "Dig in";
+    list.push({
+      label,
+      primary: i === 0,
+      run: () => commit({ type: "SHOVEL", mode: "dig", soldierId: soldier.id, coverId: token.id }),
+    });
+  });
+  if (soldier?.coverId) list.push({ label: "Leave cover", run: () => commit({ type: "SHOVEL", mode: "leave", soldierId: soldier.id }) });
+  if (ui.zone && controllerOf(state, ui.zone) === me && state.coverSupply.length) {
+    list.push({ label: `Prepare cover in ${ZONE_LABELS[ui.zone]}`, run: () => commit({ type: "SHOVEL", mode: "prepare", zone: ui.zone }) });
+  }
+  if (cover && ui.zone && ui.zone !== cover.loc && zoneDistance(cover.loc, ui.zone) === 1 && controllerOf(state, ui.zone) === me) {
+    list.push({ label: `Relocate cover to ${ZONE_LABELS[ui.zone]}`, run: () => commit({ type: "SHOVEL", mode: "relocate", coverId: cover.id, zone: ui.zone }) });
+  }
+  list.push({ label: "Done with cover", primary: list.length === 0, run: () => askLeave({ type: "SKIP_COVER" }) });
+  return list;
+}
+
+function machineGunLabel(shot) {
+  const place = ZONE_LABELS[shot.zone];
+  if (shot.kind === "exposed") return `Machine gun fires at exposed in ${place}`;
+  if (shot.kind === "mg" || shot.kind === "mortar") return `Machine gun fires at the ${capType(shot.kind)} in ${place}`;
+  const covers = coversIn(state, shot.zone);
+  const cover = covers.find((c) => c.id === shot.coverId);
+  const which = covers.length > 1 && cover
+    ? ` ${covers.indexOf(cover) + 1}${cover.revealed ? ` (defense ${cover.defense})` : ""}`
+    : "";
+  if (shot.kind === "cover-empty") return `Machine gun tries to destroy cover${which} in ${place}`;
+  return `Machine gun fires at soldiers in cover${which} in ${place}`;
+}
+
+function shotKey(shot) {
+  return [shot.kind, shot.zone, shot.coverId || "", shot.unitId || ""].join(":");
+}
+
+function attackDice(me, soldierCount, gunJoins, zone) {
+  let dice = soldierCount;
+  if (gunJoins) dice += zone === "obj" ? 4 : 3;
+  if (soldierCount > 0 && state.effects.cavalryCharge === me) dice += 1;
+  return dice;
+}
+
+function dicePhrase(n) {
+  return `${n} attack ${n === 1 ? "die" : "dice"}`;
+}
+
+function targetPhrase(shot) {
+  const place = ZONE_LABELS[shot.zone];
+  if (shot.kind === "exposed") return `exposed soldiers in ${place}`;
+  if (shot.kind === "tank") return `the tank in ${place}`;
+  if (shot.kind === "mg" || shot.kind === "mortar") return `the ${capType(shot.kind).toLowerCase()} in ${place}`;
+  const covers = coversIn(state, shot.zone);
+  const cover = covers.find((c) => c.id === shot.coverId);
+  const which = covers.length > 1 && cover
+    ? ` ${covers.indexOf(cover) + 1}${cover.revealed ? ` (defense ${cover.defense})` : ""}`
+    : "";
+  if (shot.kind === "cover-empty") return `empty cover${which} in ${place}`;
+  return `soldiers in cover${which} in ${place}`;
+}
+
+function mgCanJoin(gun, target) {
+  if (!machineGunOperational(state, gun) || !target || target.kind === "tank" || !isBattlefield(target.zone)) return false;
+  if (zoneDistance(gun.loc, target.zone) > 2) return false;
+  if (smoked(state, gun.loc, target.zone)) return false;
+  return true;
+}
+
+function machineGunHoldReason(me, gun) {
+  if (!gun) return "";
+  if (!isBattlefield(gun.loc)) return "The machine gun is not on the field.";
+  if (gun.damage >= 1) return "The machine gun has 1 damage, so it cannot fire until repaired.";
+  const player = state.players[me];
+  if (player.attackedIds.includes(gun.id)) return "The machine gun already attacked.";
+  if (player.movedEquip.includes(gun.id)) return "The machine gun already moved, so it cannot attack this round.";
+  if (state.effects.suppression === "mg" && gun.owner !== state.effects.suppressionBy) {
+    return "That machine gun is suppressed and cannot fire.";
+  }
+  return "";
+}
+
+function loneSoldierLabel(shot) {
+  const place = ZONE_LABELS[shot.zone];
+  if (shot.kind === "exposed") return `Fire at exposed in ${place}`;
+  if (shot.kind === "cover") return "Fire at soldiers in that cover";
+  if (shot.kind === "cover-empty") return "Try to destroy that cover";
+  if (shot.kind === "tank") return "Soldiers attack the tank";
+  if (shot.kind === "mg" || shot.kind === "mortar") return `Fire at the ${capType(shot.kind)}`;
+  return `Fire at ${targetPhrase(shot)}`;
+}
+
+function infantryLabel(me, soldierCount, selectedCount, gunJoins, shot) {
+  const diceText = dicePhrase(attackDice(me, soldierCount, gunJoins, shot.zone));
+  if (!soldierCount && gunJoins) return `${machineGunLabel(shot)} · ${diceText}`;
+  if (soldierCount === 1 && selectedCount === 1 && !gunJoins) {
+    const base = loneSoldierLabel(shot);
+    return state.effects.cavalryCharge === me ? `${base} · ${diceText}` : base;
+  }
+  const who = soldierCount === selectedCount
+    ? `${soldierCount} soldier${soldierCount === 1 ? "" : "s"}`
+    : `${soldierCount} of ${selectedCount} soldiers`;
+  const group = gunJoins ? `${who} and the machine gun` : who;
+  const verb = soldierCount === 1 && !gunJoins ? "fires" : "fire";
+  const sentence = `${group} ${verb} at ${targetPhrase(shot)} · ${diceText}`;
+  return gunJoins ? `Combined fire: ${sentence}` : sentence;
+}
+
+function zoneAttackTargets(me, zone) {
+  if (!isBattlefield(zone)) return [];
+  const targets = soldierStrikeTargets(state, me, zone);
+  const cover = state.covers.find((c) => c.id === ui.cover && c.loc === zone && !c.destroyed);
+  if (cover && !targets.some((target) => target.coverId === cover.id)) {
+    const inside = soldiersIn(state, zone, { matchCover: true, coverId: cover.id });
+    if (!inside.length) targets.push({ kind: "cover-empty", zone, coverId: cover.id });
+  }
+  const gear = state.equipment.find((u) => u.id === ui.targetUnit && u.loc === zone && u.owner !== me);
+  if (gear) targets.push({ kind: gear.type, zone, unitId: gear.id });
+  return targets;
+}
+
+function chooseAttackPrimary(list) {
+  if (!list.length) return;
+  const score = (button) => {
+    if (button.combined && button.zone === ui.zone) return 0;
+    if (button.combined) return 1;
+    if (button.infantry && button.zone === ui.zone) return 2;
+    if (button.infantry) return 3;
+    if (button.primary) return 4;
+    return 5;
+  };
+  let best = 0;
+  for (let i = 1; i < list.length; i += 1) {
+    if (score(list[i]) < score(list[best])) best = i;
+  }
+  list.forEach((button, i) => { button.primary = i === best; });
+}
+
+function attackButtons(me) {
+  const list = [];
+  const zone = ui.zone;
+  const player = state.players[me];
+  const selected = ui.soldiers
+    .map((id) => state.soldiers.find((s) => s.id === id && s.owner === me))
+    .filter(Boolean);
+  const spent = selected.filter((s) => player.attackedIds.includes(s.id));
+  const benched = selected.filter((s) => !player.attackedIds.includes(s.id) && !isBattlefield(s.loc));
+  const fresh = selected.filter((s) => soldierMayFire(s, player.attackedIds));
+  const unit = state.equipment.find((u) => u.id === ui.unit && u.owner === me);
+  if (unit?.type === "mortar" && isBattlefield(unit.loc)) {
+    const precision = state.effects.precision.includes(unit.id);
+    if (!precision || isBattlefield(zone)) {
+      list.push({
+        label: precision ? `Precision barrage on ${ZONE_LABELS[zone]}` : "Fire the mortar",
+        primary: true,
+        run: () => commit({ type: "START_ATTACK", kind: "mortar", unitId: unit.id, target: { kind: "allocate", zone } }),
+      });
+    }
+  }
+  if (unit?.type === "tank" && isBattlefield(unit.loc)) {
+    const cover = state.covers.find((c) => c.id === ui.cover && !c.destroyed);
+    const friendlyInside = cover && soldiersIn(state, cover.loc, { matchCover: true, coverId: cover.id }).some((s) => s.owner === me);
+    if (cover && cover.loc === unit.loc && !friendlyInside) {
+      list.push({ label: "Overrun this cover", primary: true, run: () => commit({ type: "OVERRUN", unitId: unit.id, coverId: cover.id }) });
+    }
+    if (zone && zoneDistance(unit.loc, zone) <= 1 && zone !== unit.loc) {
+      list.push({
+        label: `Tank fires on exposed in ${ZONE_LABELS[zone]}`,
+        run: () => commit({ type: "START_ATTACK", kind: "tank", unitId: unit.id, target: { kind: "exposed", zone } }),
+      });
+    } else if (zone === unit.loc) {
+      list.push({
+        label: "Tank fires on exposed here",
+        run: () => commit({ type: "START_ATTACK", kind: "tank", unitId: unit.id, target: { kind: "exposed", zone } }),
+      });
+    }
+    if (zone && zoneDistance(unit.loc, zone) <= 1) {
+      for (const shot of soldierStrikeTargets(state, me, zone)) {
+        if (shot.kind !== "cover") continue;
+        const place = zone === unit.loc ? "here" : `in ${ZONE_LABELS[zone]}`;
+        list.push({
+          label: `Tank fires on soldiers in cover ${place}`,
+          run: () => commit({
+            type: "START_ATTACK",
+            kind: "tank",
+            unitId: unit.id,
+            target: { kind: "cover", zone: shot.zone, coverId: shot.coverId },
+          }),
+        });
+      }
+    }
+  }
+  const selectedGun = unit?.type === "mg" ? unit : null;
+  const gun = machineGunOperational(state, selectedGun) ? selectedGun : null;
+  const aimed = state.equipment.find((u) => u.id === ui.targetUnit && u.owner !== me);
+  const shots = [];
+  const seen = new Set();
+  let order = 0;
+  const addShot = (shot) => {
+    if (!shot?.zone) return;
+    const key = shotKey(shot);
+    if (seen.has(key)) return;
+    seen.add(key);
+    const dist = shot.dist ?? (gun ? zoneDistance(gun.loc, shot.zone) : 0);
+    shots.push({ ...shot, dist, order: order += 1 });
+  };
+  if (fresh.length && isBattlefield(zone)) {
+    infantryFireOffers(state, me, fresh.map((s) => s.id), zone).forEach((offer) => addShot(offer.target));
+    zoneAttackTargets(me, zone).forEach(addShot);
+  }
+  if (gun) {
+    machineGunTargets(state, gun)
+      .slice()
+      .sort((a, b) => a.dist - b.dist || BATTLEFIELD.indexOf(a.zone) - BATTLEFIELD.indexOf(b.zone))
+      .forEach(addShot);
+  }
+  shots.sort((a, b) => {
+    const rank = (shot) => {
+      const soldiers = fresh.filter((s) => canSoldierTarget(s, shot)).length;
+      const joins = mgCanJoin(gun, shot);
+      if (soldiers && joins && shot.zone === zone) return 0;
+      if (soldiers && joins) return 1;
+      if (shot.zone === zone) return 2;
+      return 3;
+    };
+    return rank(a) - rank(b) || a.dist - b.dist || a.order - b.order;
+  });
+  for (const shot of shots) {
+    const firing = fresh.filter((s) => canSoldierTarget(s, shot));
+    const joins = mgCanJoin(gun, shot);
+    if (!firing.length && !joins) continue;
+    list.push({
+      label: infantryLabel(me, firing.length, fresh.length, joins, shot),
+      combined: Boolean(firing.length && joins),
+      infantry: true,
+      gunJoins: joins,
+      soldierCount: firing.length,
+      zone: shot.zone,
+      run: () => commit({
+        type: "START_ATTACK",
+        kind: "infantry",
+        attackerIds: joins ? [...firing.map((s) => s.id), gun.id] : firing.map((s) => s.id),
+        target: { kind: shot.kind, zone: shot.zone, coverId: shot.coverId, unitId: shot.unitId },
+      }),
+    });
+  }
+  const notes = [];
+  const addNote = (text) => {
+    if (text && !notes.includes(text)) notes.push(text);
+  };
+  if (spent.length === 1) addNote("That soldier already attacked.");
+  else if (spent.length) addNote("Some selected soldiers already attacked.");
+  if (benched.length) addNote("Soldiers in the trench cannot attack.");
+  if (unit?.type === "mortar" && fresh.length) addNote("Mortars never join combined fire. Fire the mortar on its own.");
+  if (unit?.type === "tank" && fresh.length) addNote("Tanks never join combined fire. Fire the tank on its own.");
+  const held = machineGunHoldReason(me, selectedGun);
+  if (selectedGun && held) addNote(held);
+  if (isBattlefield(zone) && fresh.length) {
+    if (aimed?.type === "tank" && aimed.loc === zone) {
+      const left = fresh.length - fresh.filter((s) => s.loc === zone).length;
+      if (left === 1) addNote("1 selected soldier is not in the tank's zone. Only soldiers there can attack a tank.");
+      else if (left) addNote(`${left} selected soldiers are not in the tank's zone. Only soldiers there can attack a tank.`);
+    } else {
+      const left = fresh.length - fresh.filter((s) => canSoldierTarget(s, { kind: "exposed", zone })).length;
+      if (left === 1) addNote("1 selected soldier cannot reach the selected zone, so they are left out of a shot there.");
+      else if (left) addNote(`${left} selected soldiers cannot reach the selected zone, so they are left out of a shot there.`);
+    }
+  }
+  const combined = list.some((button) => button.combined);
+  const aloneZones = [...new Set(list.filter((button) => button.gunJoins && !button.soldierCount).map((button) => ZONE_LABELS[button.zone]))];
+  if (gun && fresh.length && aloneZones.length) {
+    const where = aloneZones.length === 1 ? aloneZones[0] : aloneZones.join(", ");
+    addNote(fresh.length === 1
+      ? `That soldier cannot reach ${where}, so the machine gun fires there alone.`
+      : `Those soldiers cannot reach ${where}, so the machine gun fires there alone.`);
+  }
+  if (list.some((button) => button.soldierCount > 0 && button.soldierCount < fresh.length)) {
+    addNote("Only soldiers in a target's zone, or the next one, join that shot.");
+  }
+  if (gun && aimed?.type === "tank") addNote("Machine guns cannot shoot tanks.");
+  if (gun && fresh.length && !combined) {
+    if (isBattlefield(zone) && zoneDistance(gun.loc, zone) > 2) {
+      addNote("The machine gun is out of range of that zone, and it shares no other target with these soldiers.");
+    } else if (isBattlefield(zone) && smoked(state, gun.loc, zone)) {
+      addNote("Smoke blocks the machine gun from that zone, and it shares no other target with these soldiers.");
+    } else {
+      addNote("Those soldiers and the machine gun have no target they can both reach.");
+    }
+  } else if (gun && isBattlefield(zone) && !list.some((button) => button.zone === zone && button.gunJoins)) {
+    if (zoneDistance(gun.loc, zone) > 2) addNote("The machine gun is out of range of that zone. It can fire up to two zones away.");
+    else if (smoked(state, gun.loc, zone)) addNote("Smoke blocks the machine gun from that zone.");
+  }
+  if (state.effects.cavalryCharge === me && list.some((button) => button.soldierCount > 0)) {
+    addNote("Cavalry Charge adds 1 attack die because soldiers are firing.");
+  }
+  attackHint = notes.join(" ");
+  chooseAttackPrimary(list);
+  list.push({ label: "End attacks", primary: list.length === 0, run: () => askLeave({ type: "SKIP_ATTACK" }) });
+  return list;
+}
+
+function mortarName(_owner, face) {
+  if (face === "z1") return "Enemy Zone 1";
+  if (face === "z2") return "Enemy Zone 2";
+  if (face === "z3") return "Enemy Zone 3";
+  return ZONE_LABELS[face] || face;
+}
+
+function extraControls() {
+  const card = selectedCard();
+  if (!card || state.actionStep !== "event" || !myTurn()) return "";
+  const bits = [];
+  if (card.title === "Patrol") {
+    bits.push(`<div class="subrow">
+      <button type="button" class="${ui.dir !== "back" ? "on" : ""}" data-click="dir" data-value="forward">Forward</button>
+      <button type="button" class="${ui.dir === "back" ? "on" : ""}" data-click="dir" data-value="back">Backward</button>
+    </div>`);
+  }
+  if (eventNeeds(card.title).includes("supportType")) {
+    bits.push(`<div class="subrow">
+      <button type="button" class="${ui.supportType !== "mortar" ? "on" : ""}" data-click="support" data-value="mg">Suppress machine guns</button>
+      <button type="button" class="${ui.supportType === "mortar" ? "on" : ""}" data-click="support" data-value="mortar">Suppress mortars</button>
+    </div>`);
+  }
+  if (card.title === "Heavy Barrage" || card.title === "Bombing Run") {
+    bits.push(`<div class="subrow">
+      ${["exposed", "cover", "unit"].map((kind) => `<button type="button" class="${ui.targetKind === kind ? "on" : ""}" data-click="target-kind" data-value="${kind}">${kind === "exposed" ? "Exposed soldiers" : kind === "cover" ? "A cover" : "A weapon"}</button>`).join("")}
+    </div>`);
+  }
+  const needs = eventNeeds(card.title);
+  const notes = [];
+  if (needs.includes("soldiers")) notes.push(`${ui.soldiers.length} soldier${ui.soldiers.length === 1 ? "" : "s"} selected`);
+  if (needs.some((n) => ["zone", "enemyZone", "controlledZone"].includes(n))) notes.push(ui.zone ? ZONE_LABELS[ui.zone] : "select a zone on the map");
+  if (needs.includes("covers") || needs.includes("enemyCover")) notes.push(ui.cover ? "cover selected" : "select a cover token");
+  if (needs.includes("enemySoldier")) notes.push(ui.enemy ? "enemy soldier selected" : "select an enemy soldier");
+  if (needs.some((n) => n.startsWith("friendly"))) notes.push(ui.unit ? "your unit selected" : "select one of your weapons");
+  if (needs.includes("enemyDie")) notes.push(ui.dieIndex == null ? "click one of their dice" : `die ${ui.dieIndex + 1}`);
+  if (card.reminder) notes.push(card.reminder);
+  return `${bits.join("")}${notes.length ? `<div class="hint">${esc(notes.join(" · "))}</div>` : ""}`;
+}
+
+function wildControls() {
+  if (!myTurn() || state.phase !== "reroll") return "";
+  const me = viewer();
+  if (!state.players[me].dice.includes("wild")) return "";
+  const choices = ["boot", "whistle", "shovel", "bayonet"].filter((f) => naturalFaces(state.players[me].dice).includes(f));
+  if (!choices.length) return `<div class="hint">All five dice are Wild. They have nothing to copy.</div>`;
+  return `<div class="subrow">${choices.map((face) => `<button type="button" class="${ui.wildAs === face ? "on" : ""}" data-click="wild" data-value="${face}">Wilds as ${FACE_LABEL[face]}</button>`).join("")}</div>`;
+}
+
+function cardBlurb(card) {
+  const main = card.text || card.condition || "";
+  const extra = card.reminder && card.reminder !== main ? card.reminder : "";
+  return [main, extra].filter(Boolean).join(" ");
+}
+
+function buttonRow(list) {
+  buttons = list;
+  const hintText = [attackHint, deployNote].filter(Boolean).join(" ");
+  const hint = hintText ? `<div class="hint">${esc(hintText)}</div>` : "";
+  return `${hint}<div class="actions">${list.map((b, i) => `<button type="button" class="${b.primary ? "primary" : ""}" data-click="act" data-i="${i}"${b.hint ? ` data-tip="${esc(b.hint)}"` : ""}>${esc(b.label)}</button>`).join("")}</div>`;
+}
+
+function attackDieFace(face) {
+  const hit = face === "hit";
+  return `<span class="die attack ${hit ? "hit" : "miss"}"><span>${hit ? "Hit" : "Miss"}</span></span>`;
+}
+
+function attackReadoutLive() {
+  const roll = state.lastRoll;
+  if (!roll) return false;
+  const pending = state.pending?.type;
+  if (pending === "allocate-hits" || pending === "spotter" || pending === "mortar-target") return true;
+  return roll.kind === "mustard" && state.phase === "action" && state.actionStep === "shock";
+}
+
+function lastRoll() {
+  if (!attackReadoutLive()) return "";
+  const roll = state.lastRoll;
+  if (roll?.kind === "mustard" && roll.zones?.length) {
+    const rows = roll.zones.map((zoneRoll) => {
+      const hits = zoneRoll.hits;
+      const name = ZONE_LABELS[zoneRoll.zone] || zoneRoll.zone;
+      const faces = (zoneRoll.faces || []).map(attackDieFace).join("");
+      return `<div class="dice-row mustard-zone"><span class="tag">${esc(name)}</span>${faces}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"}</span></div>`;
+    }).join("");
+    return `<div class="mustard-rolls">${rows}</div>`;
+  }
+  if (!roll?.faces?.length) return "";
+  if (roll.kind === "mortar") {
+    return `<div class="roll-readout"><span>Mortar die</span>${roll.faces.map((f) => `<span class="${f === "blank" ? "blankface" : "hit"}">${esc(mortarName(viewer(), f))}</span>`).join("")}</div>`;
+  }
+  const hits = roll.hits;
+  return `<div class="dice-row"><span class="tag">Attack</span>${roll.faces.map(attackDieFace).join("")}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"} · 3 Hit / 3 Miss</span></div>`;
+}
+
+function stepRail() {
+  if (state.phase !== "action") return "";
+  const current = STEPS.findIndex(([id]) => id === state.actionStep);
+  return `<ol class="steps">${STEPS.map(([id, label], i) => `<li class="${i === current ? "now" : i < current ? "done" : ""}">${label}</li>`).join("")}</ol>`;
+}
+
+function cardButton(card, kind) {
+  const selected = ui.card === card.inst ? "selected" : "";
+  const blurb = cardBlurb(card);
+  return `<button type="button" class="card ${kind} ${selected}" data-click="card" data-id="${card.inst}"${blurb ? ` data-tip="${esc(blurb)}"` : ""}>
+    <div class="meta">${esc(card.type || card.category || card.timing || "")}${card.vp ? ` · ${card.vp} VP` : ""}${card.whistle ? " · 1 whistle" : ""}</div>
+    <h4>${esc(card.title)}</h4>
+    <p>${esc(card.text || card.condition || "")}</p>
+    ${kind === "mission" ? `<div class="progress">${esc(missionNote(viewer(), card))}</div>` : ""}
+  </button>`;
+}
+
+function sidebar() {
+  const me = viewer();
+  const you = state.players[me];
+  const foe = state.players[me === "uk" ? "de" : "uk"];
+  if (ui.tab === "log") {
+    return `<div class="panel">${state.log.map((line) => `<div class="log-item"><b>R${line.round}</b> ${esc(line.text)}</div>`).join("")}</div>`;
+  }
+  if (ui.tab === "missions") {
+    const done = you.completedMissions.map((m) => `<div class="quiet">${esc(m.title)} · +${m.vp}</div>`).join("");
+    return `<div class="panel"><h3>Your missions</h3>${you.missionHand.map((m) => cardButton(m, "mission")).join("") || `<p class="quiet">No missions in hand.</p>`}
+      <h3>Completed</h3>${done || `<p class="quiet">None yet.</p>`}
+      <h3>${labelSide(foe.side)} </h3><p class="quiet">${foe.missionHand.length} hidden mission${foe.missionHand.length === 1 ? "" : "s"} · ${foe.completedMissions.length} completed · ${foe.destroyedCover.length} cover destroyed</p></div>`;
+  }
+  const table = state.eventDisplay.length
+    ? `<h3>Face up on the table</h3>${state.eventDisplay.map((c) => `<div class="quiet tip-host" data-tip="${esc(cardBlurb(c))}">${esc(c.title)}</div>`).join("")}`
+    : "";
+  return `<div class="panel"><h3>Your events ${you.eventHand.length}/7</h3>${you.eventHand.map((c) => cardButton(c, "")).join("") || `<p class="quiet">No events.</p>`}
+    ${table}
+    <h3>Opponent</h3><p class="quiet">${labelSide(foe.side)} holds ${foe.eventHand.length} event${foe.eventHand.length === 1 ? "" : "s"}.</p></div>`;
+}
+
+function supplyLine() {
+  const me = viewer();
+  const mine = state.equipment.filter((u) => u.owner === me && u.loc === "supply");
+  const icons = mine.map((u) => `<img class="supply-unit ${u.type}" src="${unitSrc(u.type, me)}" alt="${esc(capType(u.type))}" title="${esc(capType(u.type))}">`).join("");
+  const mortarNote = state.phase === "action" && state.actionStep === "deploy"
+    ? ` · Mortars left in supply ${mortarsInSupply(state, me)} · Machine guns left in supply ${machineGunsInSupply(state, me)} · Tanks left in supply ${tanksInSupply(state, me)}`
+    : "";
+  return `<div class="supply-line"><span>Supply ${icons || "empty"}${mortarNote} · Cover tokens ${state.coverSupply.length}</span><span>Reserves ${countAt(me, "available")} · Casualties ${countAt(me, "casualties")}</span></div>`;
+}
+
+function resultBanner() {
+  if (state.phase !== "end") return "";
+  const title = state.winner ? `${labelSide(state.winner)} wins` : "The battle is a draw";
+  return `<div class="result"><strong>${title}</strong><span>${state.vp.uk}–${state.vp.de} · ${esc(state.tiebreak || "")}</span><button type="button" class="primary" data-click="new">New battle</button><button type="button" data-click="export-excel">Export to Excel</button></div>`;
+}
+
+function showCardTip(el) {
+  let tip = document.getElementById("card-tip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "card-tip";
+    tip.hidden = true;
+    document.body.appendChild(tip);
+  }
+  tip.textContent = el.dataset.tip || "";
+  tip.hidden = false;
+  const margin = 10;
+  const rect = el.getBoundingClientRect();
+  const width = Math.min(320, window.innerWidth - margin * 2);
+  tip.style.width = `${width}px`;
+  tip.style.left = "0px";
+  tip.style.top = "0px";
+  const height = tip.offsetHeight;
+  let left = rect.right + margin;
+  if (left + width > window.innerWidth - margin || rect.left > window.innerWidth * 0.5) {
+    left = rect.left - width - margin;
+  }
+  left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+  let top = rect.top + (rect.height - height) / 2;
+  if (rect.bottom > window.innerHeight - 140) top = rect.top - height - margin;
+  if (top + height > window.innerHeight - margin) top = window.innerHeight - height - margin;
+  if (top < margin) top = margin;
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+}
+
+function hideCardTip() {
+  const tip = document.getElementById("card-tip");
+  if (tip) tip.hidden = true;
+}
+
+function battleStamp(game) {
+  try {
+    return JSON.stringify(game);
+  } catch {
+    return "";
+  }
+}
+
+function unsavedBattle() {
+  if (!state || state.phase === "end") return false;
+  return battleStamp(state) !== savedStamp;
+}
+
+function saveRecord() {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || data.version !== 1 || !data.state?.players?.uk || !data.state?.players?.de) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function actingSide(game) {
+  const pending = game?.pending;
+  if (pending?.type === "generals-order" || pending?.type === "spotter" || pending?.type === "mortar-target" || pending?.type === "gambit") {
+    return pending.side;
+  }
+  if (game?.phase === "reroll" || game?.phase === "action" || game?.phase === "regroup") return game.active;
+  return game?.human;
+}
+
+function stepName(game) {
+  if (!game) return "Battle";
+  if (game.phase === "end") return "Battle over";
+  if (game.pending?.type === "generals-order") return "General's Order";
+  if (game.pending?.type === "spotter") return "Spotter";
+  if (game.pending?.type === "gambit") return "Mission Gambit";
+  if (game.pending?.type === "mortar-target") return "Mortar";
+  if (game.phase === "reroll") return "Action dice";
+  if (game.phase === "regroup") return "Regroup";
+  if (game.phase === "action") return STEPS.find(([id]) => id === game.actionStep)?.[1] || "Action";
+  return game.phase || "Battle";
+}
+
+function saveSummary(record) {
+  const game = record?.state;
+  if (!game) return "No saved battle.";
+  const side = actingSide(game);
+  const who = side === "uk" || side === "de" ? labelSide(side) : "Saved battle";
+  return `${who} · round ${game.round} · ${stepName(game)}.`;
+}
+
+function adoptIds(game) {
+  let max = 0;
+  const visit = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if ((key === "id" || key === "inst") && typeof value === "string") {
+        const match = /(\d+)$/.exec(value);
+        if (match) max = Math.max(max, Number(match[1]));
+      } else if (value && typeof value === "object") visit(value);
+    }
+  };
+  visit(game);
+  resetIds(max + 1);
+}
+
+function restoreSetup(record) {
+  const saved = record.setup || {};
+  const game = record.state || {};
+  if (saved.format === "short" || saved.format === "standard" || saved.format === "extended") setup.format = saved.format;
+  else if (game.format === "short" || game.format === "standard" || game.format === "extended") setup.format = game.format;
+  if (saved.human === "uk" || saved.human === "de") setup.human = saved.human;
+  else if (game.human === "uk" || game.human === "de") setup.human = game.human;
+  if (saved.mode === "solo" || saved.mode === "hotseat") setup.mode = saved.mode;
+  else setup.mode = game.mode === "hotseat" ? "hotseat" : "solo";
+  if (saved.undo === "on" || saved.undo === "off") setup.undo = saved.undo;
+}
+
+function leaveToSetup() {
+  clearMissionCelebration();
+  state = null;
+  history = [];
+  leaveAsk = null;
+  stepReturn = null;
+  ui = freshUi();
+  paused = false;
+  menuOpen = false;
+  menuConfirm = null;
+  menuNote = "";
+  render();
+}
+
+function applyLoad(record) {
+  clearMissionCelebration();
+  history = [];
+  leaveAsk = null;
+  stepReturn = null;
+  state = record.state;
+  adoptIds(state);
+  restoreSetup(record);
+  ui = freshUi();
+  ui.tab = record.tab === "missions" || record.tab === "log" ? record.tab : "events";
+  ui.acked = record.acked || null;
+  try {
+    onBattleLoaded(localStorage, state);
+  } catch {
+    /* A ledger problem must not block the loaded battle. */
+  }
+  savedStamp = battleStamp(state);
+  paused = false;
+  menuOpen = false;
+  menuConfirm = null;
+  menuNote = "";
+  render();
+}
+
+function writeSave() {
+  if (!state) {
+    menuNote = "There is no battle to save.";
+    render();
+    return;
+  }
+  const payload = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    setup: { format: setup.format, human: setup.human, mode: setup.mode, undo: setup.undo },
+    acked: ui.acked,
+    tab: ui.tab,
+    state,
+  };
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
+  } catch {
+    menuNote = "Could not save on this device.";
+    render();
+    return;
+  }
+  savedStamp = battleStamp(state);
+  menuNote = "Battle saved on this device.";
+  render();
+}
+
+function confirmCopy() {
+  if (menuConfirm === "load") {
+    return {
+      title: "Load the saved battle?",
+      body: "The battle on the table will be replaced.",
+      yes: "Load",
+      kind: "menu-load-yes",
+    };
+  }
+  if (menuConfirm === "quit") {
+    return {
+      title: "Quit to the start screen?",
+      body: unsavedBattle()
+        ? "This battle has not been saved. Quit leaves any battle already saved on this device."
+        : "You will return to the start screen. The saved battle stays on this device.",
+      yes: "Quit",
+      kind: "menu-quit-yes",
+    };
+  }
+  if (menuConfirm === "new") {
+    return {
+      title: "Start a new game?",
+      body: "This battle has not been saved. You will return to the start screen. A battle already saved on this device stays.",
+      yes: "New game",
+      kind: "menu-new-yes",
+    };
+  }
+  return {
+    title: "Delete the saved battle?",
+    body: "This removes it from this device. The battle on the table stays.",
+    yes: "Delete save",
+    kind: "menu-delete-yes",
+  };
+}
+
+function noteBattleOutcome(game) {
+  if (!game || game.phase !== "end") return;
+  try {
+    recordFinished(localStorage, game);
+  } catch {
+    /* The battle stands even if this browser cannot store the ledger. */
+  }
+}
+
+function forgetUndoneResult(game) {
+  if (!game || game.phase === "end") return;
+  try {
+    dropIfUnfinished(localStorage, game);
+  } catch {
+    /* Undoing the battle still works if the ledger cannot be updated. */
+  }
+}
+
+function downloadBytes(filename, bytes) {
+  const blob = new Blob([bytes], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function downloadBalance() {
+  let games = [];
+  let failed = false;
+  try {
+    if (state?.phase === "end") {
+      const result = recordFinished(localStorage, state);
+      games = result.games;
+      failed = Boolean(result.error);
+    } else {
+      games = readLedger(localStorage);
+    }
+  } catch {
+    failed = true;
+    games = [];
+  }
+  try {
+    const log = state?.phase === "end" ? state.log || [] : null;
+    downloadBytes(FILENAME, buildBalanceWorkbook(games, log));
+    if (failed) {
+      menuOpen = true;
+      menuNote = "The spreadsheet downloaded, but this browser could not store the balance ledger.";
+    } else if (menuOpen) {
+      menuNote = "Balance spreadsheet downloaded.";
+    }
+  } catch {
+    menuOpen = true;
+    menuNote = "Could not download the spreadsheet.";
+  }
+  render();
+}
+
+function menuActionsHtml(record) {
+  const load = `<button type="button" data-click="menu-load"${record ? "" : " disabled"}>Load</button>`;
+  const drop = `<button type="button" data-click="menu-delete"${record ? "" : " disabled"}>Delete save</button>`;
+  const excel = `<button type="button" data-click="export-excel">Export to Excel</button>`;
+  if (!state) return `${load}${drop}${excel}`;
+  return `<button type="button" class="primary" data-click="menu-resume">Resume</button>
+    <button type="button" data-click="menu-pause"${paused ? " disabled" : ""}>Pause</button>
+    <button type="button" data-click="menu-save">Save</button>
+    ${excel}
+    ${load}
+    <button type="button" data-click="menu-new">New game</button>
+    <button type="button" data-click="menu-quit">Quit</button>
+    ${drop}`;
+}
+
+function menuPanelHtml() {
+  const record = saveRecord();
+  const ask = confirmCopy();
+  const body = menuConfirm
+    ? `<p class="menu-ask">${esc(ask.title)}</p><p class="menu-note">${esc(ask.body)}</p><button type="button" class="primary" data-click="${ask.kind}">${esc(ask.yes)}</button><button type="button" data-click="menu-cancel">Cancel</button>`
+    : menuActionsHtml(record);
+  const note = menuNote ? `<p class="menu-note">${esc(menuNote)}</p>` : "";
+  return `<div class="game-menu" id="game-menu" role="dialog" aria-label="Menu"><h2>Menu</h2>${body}<p class="menu-status">${esc(record ? saveSummary(record) : "No saved battle.")}</p>${note}</div>`;
+}
+
+function menuChrome() {
+  const open = menuOpen ? "true" : "false";
+  const panel = menuOpen ? menuPanelHtml() : "";
+  const hold = state && paused
+    ? `<div class="pause-veil" data-click="pause-hold" role="dialog" aria-labelledby="pause-title"><div class="veil-card"><h2 id="pause-title">Pause</h2><p>The field is held. Open Menu and choose Resume, or press Escape.</p></div></div>`
+    : "";
+  return `<button type="button" class="menu-launch" data-click="menu" aria-expanded="${open}" aria-haspopup="dialog" aria-controls="game-menu">Menu</button>${panel}${hold}`;
+}
+
+function handleMenu(kind) {
+  if (kind === "pause-hold") return true;
+  if (kind === "export-excel") {
+    downloadBalance();
+    return true;
+  }
+  if (kind === "menu") {
+    menuOpen = !menuOpen;
+    if (!menuOpen) menuConfirm = null;
+    if (menuOpen) menuNote = "";
+    render();
+    return true;
+  }
+  if (kind === "menu-cancel") {
+    menuConfirm = null;
+    render();
+    return true;
+  }
+  if (kind === "menu-resume") {
+    paused = false;
+    menuOpen = false;
+    menuConfirm = null;
+    render();
+    return true;
+  }
+  if (kind === "menu-pause") {
+    if (!state || paused) return true;
+    paused = true;
+    menuOpen = false;
+    menuConfirm = null;
+    render();
+    return true;
+  }
+  if (kind === "menu-save") {
+    writeSave();
+    return true;
+  }
+  if (kind === "menu-load") {
+    const record = saveRecord();
+    if (!record) {
+      menuNote = "No saved battle.";
+      render();
+      return true;
+    }
+    if (state) {
+      menuConfirm = "load";
+      menuNote = "";
+      render();
+      return true;
+    }
+    applyLoad(record);
+    return true;
+  }
+  if (kind === "menu-load-yes") {
+    const record = saveRecord();
+    menuConfirm = null;
+    if (!record) {
+      menuNote = "No saved battle.";
+      render();
+      return true;
+    }
+    applyLoad(record);
+    return true;
+  }
+  if (kind === "menu-new") {
+    if (!state) return true;
+    if (unsavedBattle()) {
+      menuOpen = true;
+      menuConfirm = "new";
+      menuNote = "";
+      render();
+      return true;
+    }
+    leaveToSetup();
+    return true;
+  }
+  if (kind === "menu-new-yes" || kind === "menu-quit-yes") {
+    leaveToSetup();
+    return true;
+  }
+  if (kind === "menu-quit") {
+    if (!state) return true;
+    menuOpen = true;
+    menuConfirm = "quit";
+    menuNote = "";
+    render();
+    return true;
+  }
+  if (kind === "menu-delete") {
+    if (!saveRecord()) {
+      menuNote = "No saved battle.";
+      render();
+      return true;
+    }
+    menuConfirm = "delete";
+    menuNote = "";
+    render();
+    return true;
+  }
+  if (kind === "menu-delete-yes") {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch {
+      menuConfirm = null;
+      menuNote = "Could not delete the saved battle.";
+      render();
+      return true;
+    }
+    savedStamp = null;
+    menuConfirm = null;
+    menuNote = "Saved battle deleted.";
+    render();
+    return true;
+  }
+  return false;
+}
+
+function onMenuKey(event) {
+  if (event.key !== "Escape") return;
+  if (!menuOpen && !paused && !menuConfirm && !leaveAsk) return;
+  event.preventDefault();
+  if (leaveAsk && !menuOpen && !menuConfirm) {
+    leaveAsk = null;
+    render();
+    return;
+  }
+  if (menuConfirm) {
+    menuConfirm = null;
+    render();
+    return;
+  }
+  if (menuOpen) {
+    menuOpen = false;
+    render();
+    return;
+  }
+  if (paused) {
+    paused = false;
+    render();
+  }
+}
+
+function render() {
+  hideCardTip();
+  const root = document.getElementById("app");
+  const board = root.querySelector(".theatre");
+  const side = root.querySelector(".side-scroll");
+  const boardTop = board?.scrollTop || 0;
+  const sideTop = side?.scrollTop || 0;
+  if (!state) {
+    root.innerHTML = `${menuChrome()}${splashHtml()}`;
+    return;
+  }
+  const me = viewer();
+  const foeSide = me === "uk" ? "de" : "uk";
+  const rounds = Array.from({ length: state.maxRounds }, (_, i) => `<i class="pip-round ${i < state.round ? "on" : ""}"></i>`).join("");
+  const seatHidden = state.mode === "hotseat" && state.phase !== "end" && ui.acked !== actorSide() && actorSide();
+  const conceal = seatHidden || paused;
+  root.innerHTML = `${menuChrome()}<div class="app"${conceal ? " inert aria-hidden=\"true\"" : ""}>
+    <header class="topbar">
+      <div class="brand"><h1>Trench Shock</h1><span>${esc(formatName())} · seed ${state.initialSeed}</span></div>
+      <div class="pips" title="Round ${state.round} of ${state.maxRounds}">${rounds}</div>
+      <div class="scores">
+        <div class="score uk"><div><small>Britain</small></div><b>${state.vp.uk}</b></div>
+        <div class="score de"><div><small>Germany</small></div><b>${state.vp.de}</b></div>
+      </div>
+      ${undoButton()}
+      <button type="button" class="ghost" data-click="help">How to play</button>
+      <button type="button" class="ghost" data-click="new">New battle</button>
+    </header>
+    <div class="layout">
+      <div class="theatre"><div class="board">${boardOrder().map(renderZone).join("")}</div>${supplyLine()}</div>
+      <aside class="sidebar">
+        <div class="tabs">
+          ${["events", "missions", "log"].map((tab) => `<button type="button" class="${ui.tab === tab ? "on" : ""}" data-click="tab" data-tab="${tab}">${tab}</button>`).join("")}
+        </div>
+        <div class="side-scroll">${sidebar()}</div>
+      </aside>
+    </div>
+    <footer class="tray">
+      ${resultBanner()}
+      ${stepRail()}
+      <div class="who"><h2>${esc(phaseTitle())}</h2><div class="pool">${esc(poolText(me))}</div></div>
+      <div class="prompt" aria-live="polite">${promptText()}</div>
+      ${lastRoll()}
+      ${initiativeLine()}
+      <div class="dice-row"><span class="tag">${labelSide(me)}${state.player1 === me ? " · first" : ""}</span>${state.players[me].dice.map((f, i) => dieButton(me, f, i)).join("")}${diceCombo(me)}</div>
+      <div class="dice-row"><span class="tag">${labelSide(foeSide)}${state.player1 === foeSide ? " · first" : ""}</span>${state.players[foeSide].dice.map((f, i) => dieButton(foeSide, f, i)).join("")}${diceCombo(foeSide)}</div>
+      ${wildControls()}
+      ${extraControls()}
+      ${veilShowing() ? "" : backControl()}
+      ${buttonRow(actionList())}
+      ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}
+    </footer>
+  </div>
+  ${veilHtml()}
+  ${helpHtml()}
+  ${killHtml()}
+  ${missionHtml()}
+  ${leaveHtml()}`;
+  const nextBoard = root.querySelector(".theatre");
+  const nextSide = root.querySelector(".side-scroll");
+  if (nextBoard) nextBoard.scrollTop = boardTop;
+  if (nextSide) nextSide.scrollTop = sideTop;
+}
+
+function initiativeLine() {
+  const init = state.initiative;
+  if (!init?.winner) return "";
+  const from = init.tieRolls ? "from the deciding roll" : "from the first roll";
+  return `<div class="quiet">Initiative ${from}: Britain ${esc(init.uk.label)}, Germany ${esc(init.de.label)}. ${esc(labelSide(init.winner))} acts first.</div>`;
+}
+
+function diceCombo(side) {
+  if (state.initiative?.winner) return "";
+  const label = comboLabel(state.players[side].dice);
+  return label ? `<span class="quiet">${esc(label)}</span>` : "";
+}
+
+function formatName() {
+  return { short: "Short battle", standard: "Standard battle", extended: "Extended battle" }[state.format] || "Battle";
+}
+
+function veilHtml() {
+  if (state.mode !== "hotseat" || state.phase === "end" || ui.acked === actorSide() || !actorSide()) return "";
+  const step = state.pending?.type === "generals-order"
+    ? "General's Order"
+    : state.phase === "action"
+      ? STEPS.find(([id]) => id === state.actionStep)?.[1] || "Action"
+      : state.phase;
+  return `<div class="veil"><div class="veil-card">
+    <p>Pass the seat. The next commander is</p>
+    <h2>${labelSide(actorSide())}</h2>
+    <p>Round ${state.round} of ${state.maxRounds} · ${esc(step)}. Scores stand at Britain ${state.vp.uk}, Germany ${state.vp.de}.</p>
+    ${undoButton("veil-undo")}
+    ${backControl()}
+    <button type="button" class="primary" data-click="ready">I am ${labelSide(actorSide())}</button>
+  </div></div>`;
+}
+
+function helpHtml() {
+  if (!ui.help) return "";
+  return `<div class="modal"><div class="modal-card"><div class="rules">
+    <h2>How to play</h2>
+    <p>Two armies fight for the Objective Zone. Britain advances upward from the bottom trench in a solo game where you command Britain. Germany advances the other way. A tank in a zone contests it, so nobody controls that ground.</p>
+    <h3>The round</h3>
+    <ul>
+      <li>Both sides roll five action dice. That opening roll sets initiative. Wilds are ignored: they do not make a pair, a full house, or five of a kind. Five of a kind beats four, then a full house, three of a kind, two pair, one pair, then the highest face: Bayonet, Whistle, Shovel, Boot. If that comparison ties, both sides roll all five again and the tied roll is discarded. The roll-off does not use Roll 2 or Roll 3.</li>
+      <li>General's Order, if played, happens after the opening roll and before initiative is fixed. It may reroll two dice or change one die to a natural face already showing. The dice after that card are the ones compared. Later rolls never change the result.</li>
+      <li>The loser of initiative sets their dice first. Each side may take Roll 2 and Roll 3. On each of those rolls, any number of dice may be rerolled, including dice kept earlier. Then the winner of initiative acts through all seven steps before the loser.</li>
+      <li>On your turn: Shock, tank movement, events, deployment, movement, cover, then attacks. Empty steps are skipped.</li>
+      <li>At regroup, the side that eliminated more soldiers scores 1 VP. Each side may exchange up to two unused dice for soldiers in the trench, then draws one event. After rounds 3, 6, and 9, each side also draws a mission.</li>
+    </ul>
+    <h3>Dice</h3>
+    <ul>
+      <li>Boot — move one soldier or support weapon one zone. One Boot also advances a soldier from your trench into Zone 1.</li>
+      <li>Shovel — dig one soldier into cover, leave cover, prepare a cover token, or relocate an empty one.</li>
+      <li>Bayonet — select the bayonet dice to spend. One deploys a soldier from supply into a zone you control (once a round) or repairs one damage. Two deploys a mortar into Zone 1 if you control it and a mortar remains in supply. Each side has three mortars, three machine guns, and three tanks. Three deploys a machine gun onto a zone you control on your side if one remains in supply. Four deploys a tank into Zone 1 if one remains in supply.</li>
+      <li>Whistle — play an event that was already in your hand. Regroup draws the next event, not a Whistle.</li>
+      <li>Wild — copies one natural face when you commit. The die then shows that face and spends as if that symbol was rolled.</li>
+    </ul>
+    <h3>Fighting</h3>
+    <ul>
+      <li>Control is exposed soldiers 1, soldiers in cover 2, and an undamaged machine gun or mortar 2. One damage disables a machine gun or mortar. Tanks add nothing and contest every zone they occupy.</li>
+      <li>Seizing the objective scores 2 VP. Seizing an enemy-side zone scores 1. A tank that enters the enemy trench scores 3 and goes back to supply. The side that caused more casualties scores 1 VP at the end of the round.</li>
+      <li>Attack dice are even: 3 Hit faces and 3 Miss faces. Soldiers roll 1 against the same zone or the next one. Machine guns roll 3, or 4 against the objective, out to two zones, and cannot shoot tanks. A machine gun or mortar may move or attack, not both. Soldiers and machine guns may combine their dice on one target each can reach, while mortars and tanks shoot on their own. A mortar die shows enemy Zone 1, 2, or 3 and places 1 hit there. Tanks roll 3 dice at the same zone or the next one, or overrun cover unless an enemy tank has them engaged.</li>
+      <li>Soldiers in cover can attack and be attacked. Hits on exposed soldiers eliminate them. Cover is face down until revealed. An attack destroys that cover when its hits at least equal the defense, and reveals it even when they do not. Hits beyond the defense eliminate soldiers inside. A soldier still inside when the cover is destroyed becomes exposed.</li>
+      <li>Machine guns and mortars are destroyed at 2 damage. Tanks are destroyed at 3. Destroyed weapons return to supply.</li>
+    </ul>
+    <h3>Winning</h3>
+    <p>When the rounds run out, or the mission deck is exhausted at the end of a round, the higher victory point total wins. A tie goes to whoever controls the objective, then to whoever holds more enemy zones.</p>
+    <button type="button" class="primary" data-click="help">Back to the field</button>
+  </div></div></div>`;
+}
+
+function splashHtml() {
+  const choice = (key, value, label) => `<button type="button" class="choice ${setup[key] === value ? "on" : ""}" data-click="setup" data-key="${key}" data-value="${value}">${label}</button>`;
+  const sideChoices = setup.mode === "hotseat" ? `<p class="quiet">Britain's trench stays at the bottom of the map. Pass the seat when asked.</p>` : `<div class="choices">${choice("human", "uk", "Britain")}${choice("human", "de", "Germany")}</div>`;
+  return `<div class="splash"><div class="splash-card">
+    <div class="portraits"><div class="badge uk">${helmet("uk")}</div><div class="badge de">${helmet("de")}</div></div>
+    <h1>Trench Shock</h1>
+    <p class="lede">A World War I battle of dice, cover, and missions. Roll your action dice, push infantry across no man's land, and hold the Objective Zone.</p>
+    <div class="field"><p>Length</p><div class="choices">${choice("format", "short", "Short · 8 rounds")}${choice("format", "standard", "Standard · 10")}${choice("format", "extended", "Extended · 12")}</div></div>
+    <div class="field"><p>Opposition</p><div class="choices">${choice("mode", "solo", "Headquarters")}${choice("mode", "hotseat", "Pass and play")}</div></div>
+    <div class="field"><p>${setup.mode === "hotseat" ? "The table" : "You command"}</p>${sideChoices}</div>
+    <div class="field"><p>Undo</p><div class="choices">${choice("undo", "off", "Off")}${choice("undo", "on", "On")}</div><p class="note">On lets you take back the previous action. In pass and play, that closes when the other commander takes the seat.</p></div>
+    <button type="button" class="primary" data-click="begin">Begin battle</button>
+    <button type="button" class="ghost" data-click="help" style="margin-left:8px">How to play</button>
+    ${ui.help ? helpHtml() : ""}
+  </div></div>`;
+}
+
+function onClick(event) {
+  const el = event.target.closest("[data-click]");
+  if (!el) return;
+  const kind = el.dataset.click;
+  if (handleMenu(kind)) return;
+  if (kind === "leave-yes") {
+    confirmLeave();
+    return;
+  }
+  if (kind === "leave-no") {
+    stayOnStep();
+    return;
+  }
+  if (kind === "back-step") {
+    backToSkipped();
+    return;
+  }
+  if (kind === "kill-done") {
+    event.preventDefault();
+    event.stopPropagation();
+    dismissKill();
+    return;
+  }
+  if (leaveAsk || paused) return;
+  if (kind === "mission-done") {
+    event.preventDefault();
+    event.stopPropagation();
+    dismissMission();
+    return;
+  }
+  if (kind === "setup") {
+    setup[el.dataset.key] = el.dataset.value;
+    render();
+    return;
+  }
+  if (kind === "help") {
+    ui.help = !ui.help;
+    render();
+    return;
+  }
+  if (kind === "new") {
+    if (unsavedBattle()) {
+      menuOpen = true;
+      menuConfirm = "new";
+      menuNote = "";
+      render();
+      return;
+    }
+    leaveToSetup();
+    return;
+  }
+  if (kind === "undo") {
+    undoLast();
+    return;
+  }
+  if (kind === "begin") {
+    clearMissionCelebration();
+    ui = freshUi();
+    history = [];
+    leaveAsk = null;
+    stepReturn = null;
+    paused = false;
+    menuOpen = false;
+    menuConfirm = null;
+    menuNote = "";
+    savedStamp = null;
+    state = startMatch(catalog.events, catalog.missions, {
+      format: setup.format,
+      human: setup.mode === "hotseat" ? "uk" : setup.human,
+      mode: setup.mode,
+    });
+    ensureMatchId(state);
+    noteBattleOutcome(state);
+    render();
+    return;
+  }
+  if (!state) return;
+  if (kind === "ready") {
+    history = [];
+    leaveAsk = null;
+    stepReturn = null;
+    ui.acked = actorSide();
+    render();
+    return;
+  }
+  if (kind === "tab") {
+    ui.tab = el.dataset.tab;
+    render();
+    return;
+  }
+  if (kind === "act") {
+    buttons[Number(el.dataset.i)]?.run();
+    return;
+  }
+  if (kind === "wild") {
+    ui.wildAs = el.dataset.value;
+    render();
+    return;
+  }
+  if (kind === "dir") {
+    ui.dir = el.dataset.value;
+    render();
+    return;
+  }
+  if (kind === "support") {
+    ui.supportType = el.dataset.value;
+    render();
+    return;
+  }
+  if (kind === "target-kind") {
+    ui.targetKind = el.dataset.value;
+    render();
+    return;
+  }
+  if (!myTurn()) return;
+  if (kind === "soldier") return clickSoldier(el.dataset.id);
+  if (kind === "cover") return clickCover(el.dataset.id);
+  if (kind === "unit") return clickUnit(el.dataset.id);
+  if (kind === "zone") return clickZone(el.dataset.id);
+  if (kind === "card") {
+    ui.card = ui.card === el.dataset.id ? null : el.dataset.id;
+    if (selectedCard()?.title !== "Patrol") ui.dir = "forward";
+    render();
+    return;
+  }
+  if (kind === "die") return clickDie(el.dataset.side, Number(el.dataset.index));
+}
+
+function clickSoldier(id) {
+  if (state.pending?.type === "allocate-hits") {
+    if ((state.pending.options || []).length > 1) clickAllocTarget(id);
+    return;
+  }
+  const soldier = state.soldiers.find((s) => s.id === id);
+  if (!soldier) return;
+  const me = viewer();
+  if (state.actionStep === "move" && soldier.owner !== me) {
+    clickZone(soldier.loc);
+    return;
+  }
+  if (soldier.owner !== me) {
+    ui.enemy = ui.enemy === id ? null : id;
+    ui.zone = soldier.loc;
+  } else if (state.actionStep === "event" && (selectedCard()?.title === "Bayonet Charge" || selectedCard()?.title === "Charge")) {
+    const title = selectedCard().title;
+    const current = ui.soldiers
+      .map((sid) => state.soldiers.find((s) => s.id === sid && s.owner === me))
+      .filter(Boolean);
+    if (!current.length || current.some((s) => s.loc !== soldier.loc)) ui.soldiers = [id];
+    else if (ui.soldiers.includes(id)) ui.soldiers = ui.soldiers.filter((x) => x !== id);
+    else if (ui.soldiers.length >= 3) ui.soldiers = [...ui.soldiers.slice(0, 2), id];
+    else ui.soldiers = [...ui.soldiers, id];
+    if (title === "Bayonet Charge") {
+      const options = bayonetDestinations(state, me, soldier.loc);
+      if (!options.includes(ui.zone)) ui.zone = options.includes(stepZone(me, soldier.loc, "forward"))
+        ? stepZone(me, soldier.loc, "forward")
+        : (options[0] || null);
+    } else {
+      ui.dir = "forward";
+      ui.zone = stepZone(me, soldier.loc, "forward");
+    }
+  } else if (state.actionStep === "attack" || state.actionStep === "event") {
+    ui.soldiers = ui.soldiers.includes(id) ? ui.soldiers.filter((x) => x !== id) : [...ui.soldiers, id];
+    ui.zone = ui.zone || soldier.loc;
+  } else {
+    ui.soldiers = ui.soldiers[0] === id ? [] : [id];
+    ui.unit = null;
+    if (state.actionStep === "cover" && ui.soldiers.length) {
+      ui.zone = soldier.loc;
+      const open = state.covers.filter((c) => coverFits(me, soldier, c));
+      if (open.length === 1) ui.cover = open[0].id;
+    }
+  }
+  render();
+}
+
+function clickCover(id) {
+  if (state.pending?.type === "allocate-hits") {
+    if ((state.pending.options || []).length > 1) clickAllocTarget(id);
+    return;
+  }
+  ui.cover = ui.cover === id ? null : id;
+  const cover = state.covers.find((c) => c.id === id);
+  if (cover) ui.zone = cover.loc;
+  render();
+}
+
+function clickUnit(id) {
+  if (state.pending?.type === "allocate-hits") {
+    if ((state.pending.options || []).length > 1) clickAllocTarget(id);
+    return;
+  }
+  const unit = state.equipment.find((u) => u.id === id);
+  if (!unit) return;
+  const mine = unit.owner === viewer();
+  if (mine && state.actionStep === "attack") {
+    ui.unit = ui.unit === id ? null : id;
+    if (!ui.zone) ui.zone = unit.loc;
+    render();
+    return;
+  }
+  ui.zone = unit.loc;
+  if (mine) {
+    ui.unit = ui.unit === id ? null : id;
+    ui.soldiers = [];
+  } else {
+    ui.targetUnit = ui.targetUnit === id ? null : id;
+  }
+  render();
+}
+
+function clickZone(id) {
+  const me = viewer();
+  if (state.phase === "action" && state.actionStep === "event") {
+    const card = selectedCard();
+    const opened = state.players[me].eventsAtStep;
+    const picked = chargeSelection(me);
+    if (card && picked && (!opened || opened.includes(card.inst))) {
+      if (card.title === "Bayonet Charge" && bayonetDestinations(state, me, picked[0].loc).includes(id)) {
+        commit({
+          type: "PLAY_EVENT",
+          cardInst: card.inst,
+          params: { ...eventParams(), soldierIds: picked.map((s) => s.id), zone: id },
+        });
+        return;
+      }
+      if (card.title === "Charge" && isBattlefield(picked[0].loc) && id === stepZone(me, picked[0].loc, "forward")) {
+        commit({
+          type: "PLAY_EVENT",
+          cardInst: card.inst,
+          params: { ...eventParams(), soldierIds: picked.map((s) => s.id), zone: id, dir: "forward" },
+        });
+        return;
+      }
+    }
+  }
+  if (state.phase === "action" && state.actionStep === "move") {
+    const soldier = state.soldiers.find((s) => s.id === ui.soldiers[0] && s.owner === me);
+    if (soldier) {
+      const forward = stepZone(me, soldier.loc, "forward");
+      const back = stepZone(me, soldier.loc, "back");
+      if (id === forward || id === back) {
+        const dir = id === forward ? "forward" : "back";
+        commit(soldier.coverId
+          ? { type: "LEAVE_COVER_THEN_MOVE", unitId: soldier.id, dir, kind: "soldier" }
+          : { type: "MOVE_UNIT", kind: "soldier", unitId: soldier.id, dir });
+        return;
+      }
+    }
+    const unit = state.equipment.find((u) => u.id === ui.unit && u.owner === me && u.type !== "tank");
+    if (unit) {
+      const forward = stepZone(me, unit.loc, "forward");
+      const back = stepZone(me, unit.loc, "back");
+      if (id === forward || id === back) {
+        commit({ type: "MOVE_UNIT", kind: "weapon", unitId: unit.id, dir: id === forward ? "forward" : "back" });
+        return;
+      }
+    }
+  }
+  ui.zone = id;
+  render();
+}
+
+function clickDie(side, index) {
+  const me = viewer();
+  if (state.phase === "action" && state.actionStep === "deploy" && side === me) {
+    if (!bayonetChoice(me, index)) return;
+    const current = ui.dice.map(Number);
+    ui.dice = current.includes(index) ? current.filter((i) => i !== index) : [...current, index];
+    render();
+    return;
+  }
+  if (state.phase === "reroll" && state.active === me && side === me) {
+    commit({ type: "TOGGLE_KEEP", side: me, index }, { keepUi: true });
+    return;
+  }
+  if (state.pending?.type === "generals-order" && ui.order === "yes" && side === me) {
+    ui.dice = ui.dice.includes(index) ? ui.dice.filter((i) => i !== index) : [...ui.dice, index].slice(-2);
+    render();
+    return;
+  }
+  if (side !== me && selectedCard()?.title === "Sabotage") {
+    ui.dieIndex = index;
+    render();
+  }
+}
+
+async function boot() {
+  const root = document.getElementById("app");
+  root.addEventListener("click", onClick);
+  root.addEventListener("pointerover", (event) => {
+    const el = event.target.closest("[data-tip]");
+    if (el) showCardTip(el);
+  });
+  root.addEventListener("pointerout", (event) => {
+    const el = event.target.closest("[data-tip]");
+    if (!el) return;
+    const next = event.relatedTarget?.closest?.("[data-tip]");
+    if (next !== el) hideCardTip();
+  });
+  try {
+    const url = (name) => new URL(`../data/${name}`, import.meta.url);
+    const [events, missions] = await Promise.all([
+      fetch(url("events.json")).then((r) => r.json()),
+      fetch(url("missions.json")).then((r) => r.json()),
+    ]);
+    catalog = { events, missions };
+  } catch (err) {
+    root.innerHTML = `<div class="splash"><div class="splash-card"><h1>Trench Shock</h1><p class="lede">The game files need to be served over http. Run start.bat in this folder, then open http://127.0.0.1:8080.</p></div></div>`;
+    return;
+  }
+  document.addEventListener("keydown", onMenuKey);
+  if (new URLSearchParams(location.search).has("sim")) {
+    const result = simulateGames(catalog.events, catalog.missions, 20);
+    root.innerHTML = `<pre class="sim">${esc(JSON.stringify(result, null, 2))}</pre>`;
+    return;
+  }
+  render();
+}
+
+boot();

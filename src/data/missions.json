@@ -1,0 +1,101 @@
+[
+  {
+    "id": "MS-001",
+    "qty": 1,
+    "type": "STATE",
+    "title": "Hold in Cover",
+    "condition": "Control the Objective Zone and have at least 1 Soldier in Cover there.",
+    "vp": 1,
+    "category": "Objective / Cover"
+  },
+  {
+    "id": "MS-002",
+    "qty": 1,
+    "type": "STATE",
+    "title": "Over the Top",
+    "condition": "Have at least 3 Soldiers in the Objective Zone and/or enemy-side Zones.",
+    "vp": 2,
+    "category": "Forward Presence"
+  },
+  {
+    "id": "MS-003",
+    "qty": 2,
+    "type": "EVENT",
+    "title": "Guns Silenced",
+    "condition": "Destroy an enemy Machine Gun or Mortar this round.",
+    "vp": 1,
+    "category": "Support Weapon Kill"
+  },
+  {
+    "id": "MS-004",
+    "qty": 2,
+    "type": "EVENT",
+    "title": "Tank Hunter",
+    "condition": "Destroy an enemy Tank this round.",
+    "vp": 2,
+    "category": "Tank Kill"
+  },
+  {
+    "id": "MS-005",
+    "qty": 1,
+    "type": "STATE",
+    "title": "No Shelter",
+    "condition": "Have at least 3 Destroyed Cover tokens.",
+    "vp": 1,
+    "category": "Cover Destruction"
+  },
+  {
+    "id": "MS-006",
+    "qty": 1,
+    "type": "STATE",
+    "title": "Deep Push",
+    "condition": "Control at least 2 enemy-side Zones.",
+    "vp": 2,
+    "category": "Territory"
+  },
+  {
+    "id": "MS-007",
+    "qty": 2,
+    "type": "EVENT",
+    "title": "Shock Action",
+    "condition": "Eliminate at least 3 enemy Soldiers with a single attack this round.",
+    "vp": 1,
+    "category": "Combat Burst"
+  },
+  {
+    "id": "MS-008",
+    "qty": 1,
+    "type": "STATE",
+    "title": "In the Wire",
+    "condition": "Have at least 4 Soldiers in a single enemy-side Zone.",
+    "vp": 1,
+    "category": "Deep Infantry Presence"
+  },
+  {
+    "id": "MS-009",
+    "qty": 2,
+    "type": "STATE",
+    "title": "Dug In",
+    "condition": "At the end of the round, have at least 3 Soldiers in Cover.",
+    "vp": 1,
+    "category": "Cover / End Round"
+  },
+  {
+    "id": "MS-010",
+    "qty": 2,
+    "type": "STATE",
+    "title": "Breakthrough",
+    "condition": "At the end of the round, control the Objective Zone and at least 1 enemy-side Zone.",
+    "vp": 2,
+    "category": "Territory / End Round"
+  },
+  {
+    "id": "MS-011",
+    "qty": 1,
+    "type": "EVENT",
+    "title": "Attrition",
+    "condition": "Eliminate at least 5 enemy Soldiers this round.",
+    "vp": 2,
+    "category": "Round Attrition"
+  }
+]
