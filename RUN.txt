@@ -1,7 +1,7 @@
 Trench Shock
 How to download the game and play it
 
-Repository: (not published yet)
+Repository: https://github.com/arcoraci/eTrenchShock
 
 Download ZIP
   Open the repository page in a browser.
@@ -10,7 +10,10 @@ Download ZIP
   and a folder named src. Leave those files together.
 
 Or clone
-  Open a terminal and run git clone with the repository's https address,
+  Open a terminal and run:
+
+      git clone https://github.com/arcoraci/eTrenchShock.git
+
   then cd into the new folder. That folder should contain index.html,
   start.bat, and src.
 
