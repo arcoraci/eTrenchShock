@@ -929,10 +929,55 @@ function allocateMortar(state, action) {
   applyMortarHit(state, unit, pick);
 }
 
+function rememberMortarTarget(state, target) {
+  const cover = target.coverId ? state.covers.find((c) => c.id === target.coverId) : null;
+  const unit = target.unitId ? state.equipment.find((e) => e.id === target.unitId) : null;
+  return {
+    casualties: new Set(state.soldiers.filter((s) => s.loc === "casualties").map((s) => s.id)),
+    coverRevealed: Boolean(cover?.revealed),
+    coverDestroyed: Boolean(cover?.destroyed),
+    unitDamage: unit ? unit.damage : null,
+    unitLoc: unit ? unit.loc : null,
+  };
+}
+
+function mortarEffectPhrases(state, target, before) {
+  const phrases = [];
+  const eliminated = state.soldiers.filter((s) => s.loc === "casualties" && !before.casualties.has(s.id)).length;
+  if (eliminated === 1) phrases.push("soldier eliminated");
+  else if (eliminated > 1) phrases.push(`${eliminated} soldiers eliminated`);
+  if (target.coverId) {
+    const cover = state.covers.find((c) => c.id === target.coverId);
+    if (cover?.destroyed && !before.coverDestroyed) phrases.push("cover destroyed");
+    else if (cover?.revealed && !before.coverRevealed) phrases.push("cover revealed");
+  }
+  if (target.unitId) {
+    const unit = state.equipment.find((e) => e.id === target.unitId);
+    if (unit && before.unitLoc !== "supply" && unit.loc === "supply") phrases.push("weapon destroyed");
+    else if (unit && before.unitDamage != null && unit.damage > before.unitDamage) phrases.push("weapon damaged");
+  }
+  return phrases;
+}
+
+function showBattleNotice(state, side, text) {
+  log(state, text);
+  if (!state.killPulse) state.killPulse = [];
+  state.killPulse.push({ id: state.killPulse.length, side, text });
+}
+
+function announceMortarHit(state, side, target, before) {
+  const phrases = mortarEffectPhrases(state, target, before);
+  if (!phrases.length) return;
+  const text = `${labelSide(side)}'s mortar hits ${ZONE_LABELS[target.zone]}: ${phrases.join(", ")}.`;
+  showBattleNotice(state, side, text);
+}
+
 function applyMortarHit(state, unit, target) {
   const side = unit.owner;
   log(state, `Mortar places 1 Hit on ${target.label} in ${ZONE_LABELS[target.zone]}.`);
+  const before = rememberMortarTarget(state, target);
   applyHits(state, side, target, 1);
+  announceMortarHit(state, side, target, before);
   markMortarFired(state, unit, 1, target);
 }
 
@@ -1098,9 +1143,7 @@ function scheduledMissions(state) {
 function awardCasualtySuperiority(state, side, britainKills, germanyKills) {
   state.vp[side] += 1;
   const text = `${labelSide(side)} gains 1 victory point for the most kills this round (Britain ${britainKills}, Germany ${germanyKills}).`;
-  log(state, text);
-  if (!state.killPulse) state.killPulse = [];
-  state.killPulse.push({ id: state.killPulse.length, side, text });
+  showBattleNotice(state, side, text);
 }
 
 function casualtySuperiority(state) {
