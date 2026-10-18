@@ -1,26 +1,34 @@
 Trench Shock
-How to run the game on your computer
+How to download the game and play it
+
+Repository: (not published yet)
+
+Download ZIP
+  Open the repository page in a browser.
+  Click Code, then Download ZIP.
+  Unzip the file. Open the folder that contains index.html, start.bat,
+  and a folder named src. Leave those files together.
+
+Or clone
+  Open a terminal and run git clone with the repository's https address,
+  then cd into the new folder. That folder should contain index.html,
+  start.bat, and src.
 
 What you need
   Python 3. Download it from https://www.python.org/downloads/ if it is not
-  already installed. You do not need an account, and there is nothing to build.
-
-Unzip
-  Unzip this file. Open the folder that contains index.html, start.bat, and a
-  folder named src. Leave those files together.
+  already installed. There is nothing to build.
 
 Windows
   Double-click start.bat. A black window opens and should open the game in
   your browser. Leave that window open while you play.
-  If it says Python is not recognized, install Python 3 from python.org and
-  turn on "Add python.exe to PATH" during setup, then double-click start.bat
-  again.
-  Or open a terminal in the unzipped folder and run:
+  If it says Python is not recognized, install Python 3 again and turn on
+  "Add python.exe to PATH" during setup, then double-click start.bat again.
+  Or open a terminal in the game folder and run:
 
       python -m http.server 8080
 
 Mac or Linux
-  Open a terminal in the unzipped folder and run:
+  Open a terminal in the game folder and run:
 
       python3 -m http.server 8080
 
@@ -33,10 +41,11 @@ Open the game
 
   Do not double-click index.html. The game only works from that address.
 
-Two people, one computer
-  On the first screen, set Opposition to Pass and play, then press Begin battle.
-  When the game says "Pass the seat," hand the computer to the other person.
-  One person can play alone by leaving Opposition on Headquarters.
+Who you play
+  On the first screen, set Opposition to Pass and play for two people on
+  one computer, then press Begin battle. When the game says "Pass the seat,"
+  hand the computer to the other person.
+  To play alone, leave Opposition on Headquarters.
 
 Stop
   Click the terminal window that started the game and press Ctrl+C.
