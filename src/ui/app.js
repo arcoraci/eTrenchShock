@@ -79,7 +79,7 @@ let killToast = null;
 let killQueue = [];
 let killTimer = 0;
 let killSerial = 0;
-let setup = { format: "standard", human: "uk", mode: "solo", undo: "off" };
+let setup = { format: "standard", human: "uk", mode: "solo", undo: "off", difficulty: "Difficult" };
 let coverAsk = null;
 let ui = freshUi();
 const SAVE_KEY = "trench-shock-battle";
@@ -170,6 +170,425 @@ function faceSvg(face) {
   return `<img src="${src}" alt="" draggable="false">`;
 }
 
+const SOUND_KEY = "trench-shock-sound";
+const ACTION_POOL = ["boot", "whistle", "wild", "shovel", "bayonet"];
+const ATTACK_POOL = ["hit", "miss"];
+const MORTAR_POOL = ["z1", "z2", "z3"];
+let audioCtx = null;
+let tumble = null;
+let coverMemory = null;
+let flipPhase = new Map();
+let flipTimer = 0;
+let hitFlash = null;
+let hitFlashTimer = 0;
+let glance = null;
+let glanceTimer = 0;
+
+function reducedMotion() {
+  return typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function soundEnabled() {
+  try {
+    return localStorage.getItem(SOUND_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+
+function setSoundEnabled(on) {
+  try {
+    localStorage.setItem(SOUND_KEY, on ? "on" : "off");
+  } catch {
+    /* The toggle still changes for this page view if storage is blocked. */
+  }
+  if (!on && audioCtx) audioCtx.suspend().catch(() => {});
+}
+
+function withAudio(play) {
+  if (!soundEnabled()) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  if (!audioCtx) audioCtx = new Ctx();
+  const run = () => {
+    try {
+      play(audioCtx);
+    } catch {
+      /* A missed click is better than a thrown sound. */
+    }
+  };
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume().then(run).catch(() => {});
+    return;
+  }
+  run();
+}
+
+function tone(ctx, freq, duration, type, gain, slide) {
+  const now = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  const amp = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, now);
+  if (slide) osc.frequency.exponentialRampToValueAtTime(Math.max(1, slide), now + duration);
+  amp.gain.setValueAtTime(gain, now);
+  amp.gain.exponentialRampToValueAtTime(0.001, now + duration);
+  osc.connect(amp);
+  amp.connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + duration + 0.02);
+}
+
+function playDice() {
+  withAudio((ctx) => {
+    const now = ctx.currentTime;
+    const length = Math.floor(ctx.sampleRate * 0.045);
+    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = "highpass";
+    filter.frequency.setValueAtTime(1400, now);
+    const amp = ctx.createGain();
+    amp.gain.setValueAtTime(0.32, now);
+    amp.gain.exponentialRampToValueAtTime(0.001, now + 0.045);
+    src.connect(filter);
+    filter.connect(amp);
+    amp.connect(ctx.destination);
+    src.start(now);
+    src.stop(now + 0.05);
+  });
+}
+
+function playWhistle() {
+  withAudio((ctx) => {
+    tone(ctx, 980, 0.16, "sine", 0.08, 1680);
+    tone(ctx, 1480, 0.12, "triangle", 0.03, 1900);
+  });
+}
+
+function playThud() {
+  withAudio((ctx) => {
+    tone(ctx, 110, 0.18, "sine", 0.28, 42);
+  });
+}
+
+function playStamp() {
+  withAudio((ctx) => {
+    tone(ctx, 180, 0.07, "triangle", 0.12, 90);
+    tone(ctx, 96, 0.1, "sine", 0.16, 48);
+  });
+}
+
+function resetPresentation() {
+  window.clearTimeout(tumble?.timer);
+  tumble = null;
+  window.clearTimeout(flipTimer);
+  flipTimer = 0;
+  flipPhase = new Map();
+  window.clearTimeout(hitFlashTimer);
+  hitFlashTimer = 0;
+  hitFlash = null;
+  window.clearTimeout(glanceTimer);
+  glanceTimer = 0;
+  glance = null;
+}
+
+function flicker(key, real, pool) {
+  const size = pool.length;
+  const start = [...key].reduce((sum, ch) => sum + ch.charCodeAt(0), 0);
+  const tick = tumble?.tick || 0;
+  let face = pool[(start + tick) % size];
+  if (face === real) face = pool[(start + tick + 1) % size];
+  return face;
+}
+
+function dieVisual(kind, face) {
+  if (kind === "attack") {
+    const hit = face === "hit";
+    return { src: ATTACK_ICON[hit ? "hit" : "miss"], label: hit ? "Hit" : "Miss", hit };
+  }
+  if (kind === "mortar") {
+    const label = face === "z1" ? "Zone 1" : face === "z2" ? "Zone 2" : face === "z3" ? "Zone 3" : face;
+    return { src: MORTAR_ICON[face] || "", label, hit: false };
+  }
+  return { src: FACE_ICON[face] || "", label: FACE_LABEL[face] || face, hit: false };
+}
+
+function paintDieNode(el, face) {
+  const visual = dieVisual(el.dataset.kind, face);
+  const img = el.querySelector("img");
+  if (img && visual.src) img.src = visual.src;
+  const label = el.querySelector("span");
+  if (label) label.textContent = visual.label;
+  if (el.dataset.kind === "attack") {
+    el.classList.toggle("hit", Boolean(visual.hit));
+    el.classList.toggle("miss", !visual.hit);
+  }
+}
+
+function tumbleStep() {
+  if (!tumble) return;
+  tumble.tick += 1;
+  if (tumble.tick >= 6) {
+    const nodes = [...document.querySelectorAll("[data-tumble]")];
+    tumble = null;
+    for (const el of nodes) {
+      el.classList.remove("tumbling");
+      paintDieNode(el, el.dataset.face);
+      delete el.dataset.tumble;
+    }
+    return;
+  }
+  for (const el of document.querySelectorAll("[data-tumble]")) {
+    const pool = (el.dataset.pool || "").split(",").filter(Boolean);
+    if (!pool.length || !tumble.keys.has(el.dataset.tumble)) continue;
+    paintDieNode(el, flicker(el.dataset.tumble, el.dataset.face, pool));
+  }
+  tumble.timer = window.setTimeout(tumbleStep, 70);
+}
+
+function startTumble(keys) {
+  window.clearTimeout(tumble?.timer);
+  if (!keys?.size || reducedMotion()) {
+    tumble = null;
+    return;
+  }
+  tumble = { keys, tick: 0, timer: 0 };
+  tumble.timer = window.setTimeout(tumbleStep, 70);
+}
+
+function tumbleAttrs(key, kind, face, pool) {
+  if (!tumble?.keys.has(key)) return "";
+  return ` data-tumble="${esc(key)}" data-kind="${kind}" data-face="${esc(face)}" data-pool="${pool.join(",")}"`;
+}
+
+function freshLogs(before, after) {
+  const prev = before?.log || [];
+  const next = after?.log || [];
+  if (!prev.length) return next.map((line) => line.text);
+  const anchor = prev[0];
+  const idx = next.findIndex((line) => line.text === anchor.text && line.round === anchor.round);
+  if (idx < 0) return next.slice(0, 8).map((line) => line.text);
+  return next.slice(0, idx).map((line) => line.text);
+}
+
+function shownRollKey(game) {
+  const roll = game?.lastRoll;
+  if (!roll) return "";
+  const pending = game.pending?.type;
+  const live = pending === "allocate-hits" || pending === "spotter" || pending === "mortar-target"
+    || (roll.kind === "mustard" && game.phase === "action" && game.actionStep === "shock");
+  if (!live) return "";
+  if (roll.kind === "mustard") {
+    return `mustard:${(roll.zones || []).map((zone) => `${zone.zone}:${(zone.faces || []).join(",")}`).join("|")}`;
+  }
+  return `${roll.kind}:${(roll.faces || []).join(",")}`;
+}
+
+function addActionDice(keys, game) {
+  for (const side of ["uk", "de"]) {
+    (game?.players?.[side]?.dice || []).forEach((face, index) => {
+      if (face) keys.add(`action:${side}:${index}`);
+    });
+  }
+}
+
+function addShownRoll(keys, game) {
+  const roll = game?.lastRoll;
+  if (!roll) return;
+  if (roll.kind === "mustard") {
+    (roll.zones || []).forEach((zone, zi) => {
+      (zone.faces || []).forEach((_, fi) => keys.add(`mustard:${zi}:${fi}`));
+    });
+    return;
+  }
+  const prefix = roll.kind === "mortar" ? "mortar" : "attack";
+  (roll.faces || []).forEach((_, index) => keys.add(`${prefix}:${index}`));
+}
+
+function loggedAttackFaces(texts) {
+  const rolls = [];
+  for (const text of texts) {
+    const match = String(text || "").match(/\[((?:hit|miss)(?:, (?:hit|miss))*)\]/);
+    if (!match) continue;
+    rolls.push(match[1].split(", "));
+  }
+  return rolls;
+}
+
+function rememberGlance(faces) {
+  if (!faces?.length) return;
+  glance = { faces: faces.slice(), hits: faces.filter((face) => face === "hit").length };
+  window.clearTimeout(glanceTimer);
+  glanceTimer = window.setTimeout(() => {
+    glance = null;
+    glanceTimer = 0;
+    render();
+  }, 700);
+}
+
+function collectRolls(before, after, action) {
+  const keys = new Set();
+  const empty = { keys, whistle: false, mortar: false, glance: null };
+  if (!before?.players || !after?.players || after.error) return empty;
+  const type = action?.type;
+  const texts = freshLogs(before, after);
+  if (type === "ROLL_1" || before.round !== after.round || texts.some((text) => text.includes("reroll all five"))) {
+    addActionDice(keys, after);
+  }
+  if (type === "REROLL") {
+    const side = before.active;
+    const keep = Array.isArray(action.keep) ? action.keep : before.players[side]?.kept;
+    if (side && Array.isArray(keep)) {
+      keep.forEach((held, index) => {
+        if (held === false) keys.add(`action:${side}:${index}`);
+      });
+    }
+  }
+  if (type === "GENERALS_ORDER" && action.mode === "reroll") {
+    const side = action.side || before.pending?.side;
+    for (const index of action.indexes || []) {
+      if (side) keys.add(`action:${side}:${index}`);
+    }
+  }
+  for (const side of ["uk", "de"]) {
+    const prev = before.players[side]?.dice || [];
+    const next = after.players[side]?.dice || [];
+    const diffs = [];
+    next.forEach((face, index) => {
+      if (face && face !== prev[index]) diffs.push(index);
+    });
+    const onlyChange = type === "GENERALS_ORDER" && action.mode === "change"
+      && (action.side || before.pending?.side) === side
+      && diffs.length === 1
+      && Number(diffs[0]) === Number(action.index);
+    if (onlyChange) continue;
+    for (const index of diffs) keys.add(`action:${side}:${index}`);
+  }
+  const beforeRoll = shownRollKey(before);
+  const afterRoll = shownRollKey(after);
+  const forced = Boolean(afterRoll) && (
+    type === "START_ATTACK"
+    || (type === "SHOCK" && action.option === "gas")
+    || (type === "PLAY_EVENT" && texts.some((text) => /Mortar Die|rolls|Mustard Gas|Bayonet Charge/i.test(text)))
+  );
+  let glanceFaces = null;
+  if (afterRoll && (afterRoll !== beforeRoll || forced)) addShownRoll(keys, after);
+  else if (!afterRoll) {
+    const logged = loggedAttackFaces(texts);
+    const hidden = after.lastRoll?.kind === "attack" && (after.lastRoll.faces || []).join(",") !== ((before.lastRoll?.kind === "attack" && before.lastRoll.faces) || []).join(",")
+      ? after.lastRoll.faces
+      : null;
+    glanceFaces = logged.length ? logged[logged.length - 1] : hidden;
+    (glanceFaces || []).forEach((_, index) => keys.add(`attack:${index}`));
+  }
+  const whistle = ["uk", "de"].some((side) => {
+    const afterIds = new Set((after.players[side]?.eventHand || []).map((card) => card.inst));
+    return (before.players[side]?.eventHand || []).some((card) => (
+      !afterIds.has(card.inst) && (card.whistle !== false || card.title === "Bayonet Charge")
+    ));
+  });
+  const mortar = texts.some((text) => /Mortar places 1 Hit|mortar hits/i.test(text));
+  return { keys, whistle, mortar, glance: glanceFaces };
+}
+
+function noteJuice(before, after, action) {
+  const juice = collectRolls(before, after, action);
+  if (juice.glance) rememberGlance(juice.glance);
+  if (juice.keys.size) {
+    startTumble(juice.keys);
+    playDice();
+  }
+  if (juice.whistle) playWhistle();
+  if (juice.mortar) playThud();
+}
+
+function tumbleFreshDice(game) {
+  const keys = new Set();
+  addActionDice(keys, game);
+  if (!keys.size) return;
+  startTumble(keys);
+  playDice();
+}
+
+function noteCoverFlips() {
+  if (!state?.covers) return;
+  const next = new Map();
+  const starting = [];
+  for (const cover of state.covers) {
+    if (cover.destroyed) continue;
+    const revealed = Boolean(cover.revealed);
+    const was = coverMemory ? coverMemory.get(cover.id) : undefined;
+    if (coverMemory && was === false && revealed && !flipPhase.has(cover.id) && !reducedMotion()) starting.push(cover.id);
+    next.set(cover.id, revealed);
+  }
+  coverMemory = next;
+  if (!starting.length) return;
+  for (const id of starting) flipPhase.set(id, "out");
+  window.clearTimeout(flipTimer);
+  flipTimer = window.setTimeout(() => {
+    let changed = false;
+    for (const [id, phase] of flipPhase) {
+      if (phase === "out") {
+        flipPhase.set(id, "in");
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    render();
+    flipTimer = window.setTimeout(() => {
+      flipPhase = new Map();
+      render();
+    }, 220);
+  }, 220);
+}
+
+function armHitFlash(spec) {
+  if (!spec?.ids?.length) return;
+  hitFlash = { ids: new Set(spec.ids), cover: Boolean(spec.cover) };
+  window.clearTimeout(hitFlashTimer);
+  hitFlashTimer = window.setTimeout(() => {
+    hitFlash = null;
+    hitFlashTimer = 0;
+    render();
+  }, 420);
+}
+
+function assignmentTargets(action, game) {
+  if (!action || !game) return null;
+  if (action.type === "ALLOCATE_HITS") {
+    const ids = (action.picks || []).filter(Boolean);
+    const coverId = game.pending?.target?.coverId || null;
+    if (coverId) ids.push(coverId);
+    return ids.length ? { ids, cover: Boolean(coverId) } : null;
+  }
+  if (action.type === "ALLOCATE_MORTAR") {
+    const option = (game.pending?.options || []).find((item) => item.id === action.targetId);
+    if (!option) return null;
+    const ids = [option.id, option.coverId, option.soldierId, option.unitId].filter(Boolean);
+    const cover = Boolean(option.coverId || option.kind === "cover" || option.kind === "cover-empty");
+    if (cover && option.coverId) ids.push(option.coverId);
+    return { ids, cover };
+  }
+  return null;
+}
+
+function flashIdsFor(id) {
+  const ids = [id];
+  const coverId = state.pending?.target?.coverId;
+  if (coverId) ids.push(coverId);
+  return ids;
+}
+
+function promptFlashClass() {
+  if (!hitFlash?.cover) return "";
+  if (state?.pending?.type !== "allocate-hits" || !state.pending?.target?.coverId) return "";
+  return " hit-flash";
+}
+
 function attackResolving(game) {
   const type = game?.pending?.type;
   return type === "allocate-hits" || type === "spotter" || type === "mortar-target";
@@ -221,6 +640,7 @@ function commit(action, opts = {}) {
   const prev = actorSide();
   const beforePulse = (state?.missionPulse || []).map((pulse) => `${pulse.side}:${pulse.inst}`);
   const beforeKills = (state?.killPulse || []).map((note) => note.id);
+  const allocFlash = assignmentTargets(action, state);
   const undoSnap = clone(state);
   if (state) ensureMatchId(state);
   if (opts.leaving) {
@@ -246,6 +666,8 @@ function commit(action, opts = {}) {
   }
   if (!state.error) trackUndo(action, undoSnap, state);
   if (!state.error) noteBattleOutcome(state);
+  if (!state.error) noteJuice(undoSnap, state, action);
+  if (!state.error && allocFlash) armHitFlash(allocFlash);
   if (!state.error) queueKillCelebration(beforeKills, state);
   if (!state.error) queueMissionCelebration(beforePulse, state);
   if (!state.error && !opts.keepUi) {
@@ -601,6 +1023,7 @@ function backToSkipped() {
   attackDraft = null;
   if (history.length && history[history.length - 1] === snap) history.pop();
   clearMissionCelebration();
+  resetPresentation();
   state = snap;
   holdEmpty = { step: state.actionStep, active: state.active, round: state.round };
   forgetUndoneResult(state);
@@ -632,6 +1055,7 @@ function leaveHtml() {
 function undoLast() {
   if (setup.undo !== "on" || !history.length || !state) return;
   clearMissionCelebration();
+  resetPresentation();
   stepReturn = null;
   leaveAsk = null;
   actionUndo = null;
@@ -651,6 +1075,7 @@ function undoLastAction() {
   const snap = actionUndo.before;
   if (history.length && history[history.length - 1] === snap) history.pop();
   clearMissionCelebration();
+  resetPresentation();
   stepReturn = null;
   leaveAsk = null;
   actionUndo = null;
@@ -726,6 +1151,7 @@ function queueMissionCelebration(before, after) {
   }
   if (!fresh.length) return;
   missionQueue.push(...fresh);
+  playStamp();
   if (!missionToast && !killToast && !killQueue.length) revealMission();
 }
 
@@ -834,6 +1260,26 @@ function countAt(side, loc) {
   return state.soldiers.filter((s) => s.owner === side && s.loc === loc).length;
 }
 
+function zoneHold(id) {
+  let cls = "open";
+  let name = "Open";
+  if (!isBattlefield(id)) {
+    cls = id.startsWith("de") ? "de" : "uk";
+    name = labelSide(cls);
+  } else if (isContested(state, id)) {
+    cls = "contested";
+    name = "Contested";
+  } else {
+    const side = controllerOf(state, id);
+    if (side) {
+      cls = side;
+      name = labelSide(side);
+    }
+  }
+  const vp = id === "obj" ? `<b class="obj-vp">2 VP</b>` : "";
+  return `<div class="zone-hold ${cls}"><i class="flag" aria-hidden="true"></i><span>${esc(name)}</span>${vp}</div>`;
+}
+
 function renderZone(id) {
   const ukAll = state.soldiers.filter((s) => s.loc === id && s.owner === "uk");
   const deAll = state.soldiers.filter((s) => s.loc === id && s.owner === "de");
@@ -856,7 +1302,7 @@ function renderZone(id) {
   const smoke = state.effects.smoke.includes(id) ? `<span class="zone-meta">Smoke screen</span>` : "";
   const counts = ukAll.length || deAll.length ? `${ukAll.length} British · ${deAll.length} German` : "Empty";
   return `<div class="${classes.filter(Boolean).join(" ")}" data-click="zone" data-id="${id}">
-    <div class="zone-name">${nation}<strong>${esc(ZONE_LABELS[id])}</strong>${counts}${smoke}</div>
+    <div class="zone-name">${zoneHold(id)}${nation}<strong>${esc(ZONE_LABELS[id])}</strong>${counts}${smoke}</div>
     <div class="zone-body">${uk.map((s) => soldierButton(s)).join("")}${covers.map(coverButton).join("")}${gear.map(unitButton).join("")}${de.map((s) => soldierButton(s)).join("")}</div>
     <div class="zone-ctrl">${ctrl}</div>
   </div>`;
@@ -885,7 +1331,8 @@ function soldierButton(soldier, inCover = false) {
   const flag = actionFlag(soldier.owner, soldier.id);
   const mark = allocMark(soldier.id);
   const title = `${labelSide(soldier.owner)} soldier, ${inCover ? "in this cover" : "exposed"}${flag.className ? `, ${flag.className}` : ""}${mark.count ? `, ${mark.count} hit${mark.count === 1 ? "" : "s"} assigned` : ""}`;
-  return `<button type="button" class="token ${soldier.owner} ${selected} ${targeted} ${flag.className} ${mark.on ? "alloc" : ""} ${inCover ? "nested" : ""}" data-click="soldier" data-id="${soldier.id}" aria-label="${esc(title)}" title="${esc(title)}">${helmet(soldier.owner)}${flag.mark}</button>`;
+  const flash = hitFlash?.ids?.has(soldier.id) ? "hit-flash" : "";
+  return `<button type="button" class="token ${soldier.owner} ${selected} ${targeted} ${flag.className} ${mark.on ? "alloc" : ""} ${flash} ${inCover ? "nested" : ""}" data-click="soldier" data-id="${soldier.id}" aria-label="${esc(title)}" title="${esc(title)}">${helmet(soldier.owner)}${flag.mark}</button>`;
 }
 
 function coverFightPreview(cover) {
@@ -924,14 +1371,22 @@ function coverButton(cover) {
     else if (preview.destroyed) live = "broken";
   }
   const mark = allocMark(cover.id);
-  const title = preview
+  const phase = flipPhase.get(cover.id) || "";
+  if (phase === "out") {
+    value = "?";
+    live = "";
+  }
+  const opened = phase === "out" ? false : Boolean(cover.revealed || preview);
+  const title = preview && phase !== "out"
     ? coverCountdownText(cover.defense, preview.hits, pendingOccupants(cover, preview))
     : `Cover ${cover.revealed ? "defense " + cover.defense : "unrevealed"}, ${occ.length} inside${mark.count ? `, ${mark.count} hits assigned` : ""}`;
   const count = occ.length
     ? `<button type="button" class="cover-count" data-click="cover" data-id="${cover.id}" aria-label="${occ.length} in this cover">${occ.length}</button>`
     : "";
+  const flash = hitFlash?.ids?.has(cover.id) ? "hit-flash" : "";
+  const spin = phase ? `cover-flip ${phase}` : "cover-flip";
   return `<div class="dugout ${occ.length ? "held" : ""}">
-    <button type="button" class="cover ${cover.revealed || preview ? "open" : ""} ${live} ${selected} ${mark.on ? "alloc" : ""}" data-click="cover" data-id="${cover.id}" aria-label="${esc(title)}" title="${esc(title)}"><img src="assets/cover-token.jpg" alt="" draggable="false"><b>${esc(value)}</b></button>
+    <button type="button" class="cover ${opened ? "open" : ""} ${live} ${selected} ${mark.on ? "alloc" : ""} ${flash}" data-click="cover" data-id="${cover.id}" aria-label="${esc(title)}" title="${esc(title)}"><span class="${spin}"><img src="assets/cover-token.jpg" alt="" draggable="false"><b>${esc(value)}</b></span></button>
     <div class="occupants">${occ.map((s) => soldierButton(s, true)).join("")}</div>
     ${count}
   </div>`;
@@ -1054,10 +1509,15 @@ function dieButton(side, face, index) {
   if (go && ui.dice.includes(index)) classes.push("go");
   if (sabotage && ui.dieIndex === index) classes.push("go");
   const display = face === "wild" && player.committed && player.wildAs ? player.wildAs : face;
-  const shown = FACE_LABEL[display] || "Spent";
+  const key = `action:${side}:${index}`;
+  const spinning = Boolean(display && tumble?.keys.has(key));
+  const shownFace = spinning ? flicker(key, display, ACTION_POOL) : display;
+  const shown = FACE_LABEL[shownFace] || "Spent";
+  if (spinning) classes.push("tumbling");
   const enabled = Boolean(face) && (reroll || go || sabotage || deployPick);
   const title = spent ? "Used" : picked ? "Selected to spend" : deployPick ? "Select this bayonet" : display === "shovel" ? "Dig one soldier into cover" : "";
-  return `<button type="button" class="${classes.filter(Boolean).join(" ")}" data-click="die" data-side="${side}" data-index="${index}" ${title ? `title="${title}"` : ""} ${picked ? `aria-pressed="true"` : ""} ${enabled ? "" : "disabled"}>${display ? faceSvg(display) : ""}<span>${esc(shown)}</span></button>`;
+  const motion = spinning ? tumbleAttrs(key, "action", display, ACTION_POOL) : "";
+  return `<button type="button" class="${classes.filter(Boolean).join(" ")}" data-click="die" data-side="${side}" data-index="${index}" ${title ? `title="${title}"` : ""} ${picked ? `aria-pressed="true"` : ""} ${enabled ? "" : "disabled"}${motion}>${shownFace ? faceSvg(shownFace) : ""}<span>${esc(shown)}</span></button>`;
 }
 
 function selectedCard() {
@@ -1182,6 +1642,7 @@ function addAllocHit(id) {
   const stack = ui.allocStack || [];
   if (stack.length >= pending.hits) return;
   ui.allocStack = [...stack, id];
+  armHitFlash({ ids: flashIdsFor(id), cover: Boolean(pending.target?.coverId) });
   render();
 }
 
@@ -1195,6 +1656,7 @@ function clickAllocTarget(id) {
     ui.allocStack = next;
   } else if (stack.length < state.pending.hits) {
     ui.allocStack = [...stack, id];
+    armHitFlash({ ids: flashIdsFor(id), cover: Boolean(state.pending?.target?.coverId) });
   }
   render();
 }
@@ -1997,18 +2459,24 @@ function buttonRow(list) {
   return `${hint}<div class="actions">${actionUndoButton()}${list.map((b, i) => `<button type="button" class="${b.primary ? "primary" : ""}" data-click="act" data-i="${i}"${b.hint ? ` data-tip="${esc(b.hint)}"` : ""}>${esc(b.label)}</button>`).join("")}</div>`;
 }
 
-function attackDieFace(face) {
-  const hit = face === "hit";
+function attackDieFace(face, key) {
+  const spinning = Boolean(key && tumble?.keys.has(key));
+  const shown = spinning ? flicker(key, face, ATTACK_POOL) : face;
+  const hit = shown === "hit";
   const src = ATTACK_ICON[hit ? "hit" : "miss"];
   const word = hit ? "Hit" : "Miss";
-  return `<span class="die attack ${hit ? "hit" : "miss"}"><img src="${src}" alt="" draggable="false"><span>${word}</span></span>`;
+  const motion = spinning ? tumbleAttrs(key, "attack", face, ATTACK_POOL) : "";
+  return `<span class="die attack ${hit ? "hit" : "miss"}${spinning ? " tumbling" : ""}"${motion}><img src="${src}" alt="" draggable="false"><span>${word}</span></span>`;
 }
 
-function mortarDieFace(face) {
-  const src = MORTAR_ICON[face];
-  const word = face === "z1" ? "Zone 1" : face === "z2" ? "Zone 2" : face === "z3" ? "Zone 3" : mortarName(viewer(), face);
-  if (!src) return `<span class="die attack miss"><span>${esc(word)}</span></span>`;
-  return `<span class="die attack zone"><img src="${src}" alt="" draggable="false"><span>${esc(word)}</span></span>`;
+function mortarDieFace(face, key) {
+  const spinning = Boolean(key && face && tumble?.keys.has(key));
+  const shown = spinning ? flicker(key, face, MORTAR_POOL) : face;
+  const src = MORTAR_ICON[shown];
+  const word = shown === "z1" ? "Zone 1" : shown === "z2" ? "Zone 2" : shown === "z3" ? "Zone 3" : mortarName(viewer(), shown);
+  const motion = spinning ? tumbleAttrs(key, "mortar", face, MORTAR_POOL) : "";
+  if (!src) return `<span class="die attack miss${spinning ? " tumbling" : ""}"${motion}><span>${esc(word)}</span></span>`;
+  return `<span class="die attack zone${spinning ? " tumbling" : ""}"${motion}><img src="${src}" alt="" draggable="false"><span>${esc(word)}</span></span>`;
 }
 
 function attackReadoutLive() {
@@ -2020,23 +2488,27 @@ function attackReadoutLive() {
 }
 
 function lastRoll() {
-  if (!attackReadoutLive()) return "";
+  if (!attackReadoutLive()) {
+    if (!glance?.faces?.length) return "";
+    const hits = glance.hits;
+    return `<div class="dice-row"><span class="tag">Attack</span>${glance.faces.map((face, index) => attackDieFace(face, `attack:${index}`)).join("")}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"} · 3 Hit / 3 Miss</span></div>`;
+  }
   const roll = state.lastRoll;
   if (roll?.kind === "mustard" && roll.zones?.length) {
-    const rows = roll.zones.map((zoneRoll) => {
+    const rows = roll.zones.map((zoneRoll, zi) => {
       const hits = zoneRoll.hits;
       const name = ZONE_LABELS[zoneRoll.zone] || zoneRoll.zone;
-      const faces = (zoneRoll.faces || []).map(attackDieFace).join("");
+      const faces = (zoneRoll.faces || []).map((face, fi) => attackDieFace(face, `mustard:${zi}:${fi}`)).join("");
       return `<div class="dice-row mustard-zone"><span class="tag">${esc(name)}</span>${faces}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"}</span></div>`;
     }).join("");
     return `<div class="mustard-rolls">${rows}</div>`;
   }
   if (!roll?.faces?.length) return "";
   if (roll.kind === "mortar") {
-    return `<div class="dice-row"><span class="tag">Mortar</span>${roll.faces.map((face) => mortarDieFace(face)).join("")}</div>`;
+    return `<div class="dice-row"><span class="tag">Mortar</span>${roll.faces.map((face, index) => mortarDieFace(face, `mortar:${index}`)).join("")}</div>`;
   }
   const hits = roll.hits;
-  return `<div class="dice-row"><span class="tag">Attack</span>${roll.faces.map(attackDieFace).join("")}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"} · 3 Hit / 3 Miss</span></div>`;
+  return `<div class="dice-row"><span class="tag">Attack</span>${roll.faces.map((face, index) => attackDieFace(face, `attack:${index}`)).join("")}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"} · 3 Hit / 3 Miss</span></div>`;
 }
 
 function stepRail() {
@@ -2227,11 +2699,15 @@ function restoreSetup(record) {
   if (saved.mode === "solo" || saved.mode === "hotseat") setup.mode = saved.mode;
   else setup.mode = game.mode === "hotseat" ? "hotseat" : "solo";
   if (saved.undo === "on" || saved.undo === "off") setup.undo = saved.undo;
+  if (saved.difficulty === "Easy" || saved.difficulty === "Difficult" || saved.difficulty === "Hard") setup.difficulty = saved.difficulty;
+  else if (game.difficulty === "Easy" || game.difficulty === "Difficult" || game.difficulty === "Hard") setup.difficulty = game.difficulty;
 }
 
 function leaveToSetup() {
   clearMissionCelebration();
   clearEmptyTimer();
+  resetPresentation();
+  coverMemory = null;
   state = null;
   coverAsk = null;
   history = [];
@@ -2252,6 +2728,8 @@ function leaveToSetup() {
 function applyLoad(record) {
   clearMissionCelebration();
   clearEmptyTimer();
+  resetPresentation();
+  coverMemory = null;
   history = [];
   leaveAsk = null;
   stepReturn = null;
@@ -2287,7 +2765,7 @@ function writeSave() {
   const payload = {
     version: 1,
     savedAt: new Date().toISOString(),
-    setup: { format: setup.format, human: setup.human, mode: setup.mode, undo: setup.undo },
+    setup: { format: setup.format, human: setup.human, mode: setup.mode, undo: setup.undo, difficulty: setup.difficulty },
     acked: ui.acked,
     tab: ui.tab,
     state,
@@ -2555,6 +3033,11 @@ function menuActionsHtml(record) {
     ${update}`;
 }
 
+function soundControlHtml() {
+  const on = soundEnabled();
+  return `<button type="button" data-click="menu-sound" aria-pressed="${on ? "true" : "false"}">Sound ${on ? "on" : "off"}</button>`;
+}
+
 function menuPanelHtml() {
   const record = saveRecord();
   const ask = confirmCopy();
@@ -2563,7 +3046,7 @@ function menuPanelHtml() {
     : menuActionsHtml(record);
   const note = menuNote ? `<p class="menu-note">${esc(menuNote)}</p>` : "";
   const link = menuLink ? `<p class="menu-note"><a href="${esc(menuLink)}">${esc(menuLink)}</a></p>` : "";
-  return `<div class="game-menu" id="game-menu" role="dialog" aria-label="Menu"><h2>Menu</h2>${body}<p class="menu-status">${esc(record ? saveSummary(record) : "No saved battle.")}</p>${note}${link}</div>`;
+  return `<div class="game-menu" id="game-menu" role="dialog" aria-label="Menu"><h2>Menu</h2>${soundControlHtml()}${body}<p class="menu-status">${esc(record ? saveSummary(record) : "No saved battle.")}</p>${note}${link}</div>`;
 }
 
 function menuChrome() {
@@ -2576,6 +3059,11 @@ function menuChrome() {
 }
 
 function handleMenu(kind) {
+  if (kind === "menu-sound") {
+    setSoundEnabled(!soundEnabled());
+    render();
+    return true;
+  }
   if (kind === "pause-hold") return true;
   if (kind !== "menu-update" && kind !== "menu-update-yes") menuLink = "";
   if (kind === "export-excel") {
@@ -2793,11 +3281,16 @@ function render() {
     root.innerHTML = `${menuChrome()}${coverAsk ? coverPlaceHtml() : splashHtml()}`;
     return;
   }
+  noteCoverFlips();
+  const seatHidden = state.mode === "hotseat" && state.phase !== "end" && ui.acked !== actorSide() && actorSide();
+  if (seatHidden) {
+    root.innerHTML = `${menuChrome()}${veilHtml()}${helpHtml()}${killHtml()}${missionHtml()}${leaveHtml()}`;
+    return;
+  }
   const me = viewer();
   const foeSide = me === "uk" ? "de" : "uk";
   const rounds = Array.from({ length: state.maxRounds }, (_, i) => `<i class="pip-round ${i < state.round ? "on" : ""}"></i>`).join("");
-  const seatHidden = state.mode === "hotseat" && state.phase !== "end" && ui.acked !== actorSide() && actorSide();
-  const conceal = seatHidden || paused;
+  const conceal = paused;
   root.innerHTML = `${menuChrome()}<div class="app"${conceal ? " inert aria-hidden=\"true\"" : ""}>
     <header class="topbar">
       <div class="brand"><h1>Trench Shock</h1><span>${esc(formatName())} · seed ${state.initialSeed}</span></div>
@@ -2824,9 +3317,9 @@ function render() {
       ${resultBanner()}
       ${stepRail()}
       <div class="who"><h2>${esc(phaseTitle())}</h2><div class="pool">${esc(poolText(me))}</div></div>
-      <div class="prompt" aria-live="polite">${promptText()}</div>
+      <div class="prompt${promptFlashClass()}" aria-live="polite">${promptText()}</div>
       ${lastRoll()}
-      ${initiativeLine()}
+      ${roundBanner()}
       ${state.initiative?.winner ? `<div class="quiet table-label">On the table</div>` : ""}
       <div class="dice-row"><span class="tag">${labelSide(me)}${state.player1 === me ? " · first" : ""}</span>${state.players[me].dice.map((f, i) => dieButton(me, f, i)).join("")}${diceCombo(me)}</div>
       <div class="dice-row"><span class="tag">${labelSide(foeSide)}${state.player1 === foeSide ? " · first" : ""}</span>${state.players[foeSide].dice.map((f, i) => dieButton(foeSide, f, i)).join("")}${diceCombo(foeSide)}</div>
@@ -2857,6 +3350,17 @@ function pinFace(face) {
   return `<span class="pin-die"><img src="${src}" alt="" draggable="false"></span>`;
 }
 
+function roundTitleText() {
+  const round = state?.round || 1;
+  const first = state?.player1;
+  if (first === "uk" || first === "de") return `Round ${round} — ${labelSide(first)} acts first`;
+  return `Round ${round}`;
+}
+
+function roundBanner() {
+  return `<div class="round-banner"><p class="round-title">${esc(roundTitleText())}</p>${initiativeLine()}</div>`;
+}
+
 function initiativeLine() {
   const pin = pinnedInitiative(state);
   if (!pin) return "";
@@ -2880,20 +3384,15 @@ function formatName() {
 
 function veilHtml() {
   if (state.mode !== "hotseat" || state.phase === "end" || ui.acked === actorSide() || !actorSide()) return "";
-  const step = state.pending?.type === "pick-mission"
-    ? "Choose a mission"
-    : state.pending?.type === "generals-order"
-    ? "General's Order"
-    : state.phase === "action"
-      ? STEPS.find(([id]) => id === state.actionStep)?.[1] || "Action"
-      : state.phase;
-  return `<div class="veil"><div class="veil-card">
-    <p>Pass the seat. The next commander is</p>
-    <h2>${labelSide(actorSide())}</h2>
-    <p>Round ${state.round} of ${state.maxRounds} · ${esc(step)}. Scores stand at Britain ${state.vp.uk}, Germany ${state.vp.de}.</p>
+  const side = actorSide();
+  const file = side === "de" ? "soldier-german.png" : "soldier-british.png";
+  const name = labelSide(side);
+  return `<div class="veil seat-screen" role="dialog" aria-modal="true" aria-label="Pass the seat"><div class="veil-card seat-card">
+    <img class="seat-portrait" src="assets/${file}" alt="">
+    <h2>${esc(name)}</h2>
     ${undoButton("veil-undo")}
     ${backControl()}
-    <button type="button" class="primary" data-click="ready">I am ${labelSide(actorSide())}</button>
+    <button type="button" class="primary" data-click="ready">I am ${esc(name)}</button>
   </div></div>`;
 }
 
@@ -2910,6 +3409,7 @@ function helpHtml() {
       <li>On your turn: Shock, tank movement, events, deployment, movement, cover, then attacks. Empty steps are skipped.</li>
       <li>At regroup, the side that eliminated more soldiers scores 1 VP. Each side may exchange up to two unused dice for soldiers in the trench, then draws one event. After rounds 3, 6, and 9, each side also draws a mission.</li>
       <li>Before the first round, each side places one cover token in Zone 1, Zone 2, or Zone 3 on its own side. Headquarters places its cover in Zone 1.</li>
+      <li>Headquarters plays Easy, Difficult, or Hard. Difficult is the standard opponent. Pass and play does not use a difficulty.</li>
       <li>A side completes at most one mission each round. If more than one is ready, that commander chooses which one scores. The others stay incomplete.</li>
     </ul>
     <h3>Dice</h3>
@@ -2944,6 +3444,7 @@ function splashHtml() {
     <div class="field"><p>Length</p><div class="choices">${choice("format", "short", "Short · 8 rounds")}${choice("format", "standard", "Standard · 10")}${choice("format", "extended", "Extended · 12")}</div></div>
     <div class="field"><p>Opposition</p><div class="choices">${choice("mode", "solo", "Headquarters")}${choice("mode", "hotseat", "Pass and play")}</div></div>
     <div class="field"><p>${setup.mode === "hotseat" ? "The table" : "You command"}</p>${sideChoices}</div>
+    ${setup.mode === "hotseat" ? "" : `<div class="field"><p>Difficulty</p><div class="choices">${choice("difficulty", "Easy", "Easy")}${choice("difficulty", "Difficult", "Difficult")}${choice("difficulty", "Hard", "Hard")}</div><p class="note">Headquarters plays this way. Difficult is the standard opponent.</p></div>`}
     <div class="field"><p>Undo</p><div class="choices">${choice("undo", "off", "Off")}${choice("undo", "on", "On")}</div><p class="note">On lets you take back the previous action. In pass and play, that closes when the other commander takes the seat.</p></div>
     <button type="button" class="primary" data-click="begin">Begin battle</button>
     <button type="button" class="ghost" data-click="help" style="margin-left:8px">How to play</button>
@@ -2986,14 +3487,18 @@ function launchBattle(coverZones) {
   menuNote = "";
   savedStamp = null;
   coverAsk = null;
+  resetPresentation();
+  coverMemory = null;
   state = startMatch(catalog.events, catalog.missions, {
     format: setup.format,
     human: setup.mode === "hotseat" ? "uk" : setup.human,
     mode: setup.mode,
+    difficulty: setup.mode === "solo" ? setup.difficulty : null,
     coverZones,
   });
   ensureMatchId(state);
   noteBattleOutcome(state);
+  tumbleFreshDice(state);
   render();
 }
 

@@ -559,7 +559,7 @@ function moveTank(state, action) {
     }
     if (nxt === enemyTrench(tank.owner)) {
       state.vp[tank.owner] += 3;
-      log(state, `${labelSide(tank.owner)} Tank breaks into the enemy Trench (+3 VP).`);
+      showBattleNotice(state, tank.owner, `${labelSide(tank.owner)} gains 3 victory points for the tank breakthrough.`);
       tank.loc = "supply";
       tank.damage = 0;
       refreshControl(state, { tankLeft: true });

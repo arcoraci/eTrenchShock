@@ -201,10 +201,17 @@ const FORMAT_NAMES = {
   extended: "Extended Battle",
 };
 
+function headquartersDifficulty(mode, value) {
+  if (mode !== "solo") return null;
+  if (value === "Easy" || value === "Difficult" || value === "Hard") return value;
+  return "Difficult";
+}
+
 export function createGame(events, missions, options = {}) {
   const format = options.format || "standard";
   const human = options.human === "de" ? "de" : "uk";
   const mode = options.mode || "solo";
+  const difficulty = headquartersDifficulty(mode, options.difficulty);
   resetIds(1);
   const spec = FORMATS[format] || FORMATS.standard;
   const seed = options.seed != null ? options.seed >>> 0 : (Date.now() >>> 0);
@@ -220,6 +227,7 @@ export function createGame(events, missions, options = {}) {
     matchId: options.matchId || createMatchId(),
     human,
     ai: human === "uk" ? "de" : "uk",
+    difficulty,
     phase: "setup",
     actionStep: null,
     active: null,
@@ -269,7 +277,7 @@ export function createGame(events, missions, options = {}) {
   } else if (mode === "sim") {
     log(state, `${FORMAT_NAMES[format] || "Battle"} — ${spec.rounds} rounds.`);
   } else {
-    log(state, `${FORMAT_NAMES[format] || "Battle"} — ${spec.rounds} rounds. You command ${who}.`);
+    log(state, `${FORMAT_NAMES[format] || "Battle"} — ${spec.rounds} rounds. You command ${who}. Headquarters: ${difficulty}.`);
   }
   beginInitiative(state);
   return state;

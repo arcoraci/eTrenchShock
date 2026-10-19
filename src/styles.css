@@ -902,8 +902,113 @@ button { cursor: pointer; }
 }
 .pause-veil .veil-card { text-align: center; }
 
+.zone-hold {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 16px;
+  margin: 0 0 4px;
+  padding-bottom: 2px;
+  border-bottom: 4px solid rgba(255, 255, 255, 0.18);
+}
+.zone-hold.uk { border-bottom-color: #8d4a32; }
+.zone-hold.de { border-bottom-color: #7f8f84; }
+.zone-hold.contested { border-bottom-color: #d7b15a; }
+.zone-hold .flag {
+  width: 14px;
+  height: 10px;
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.28);
+  position: relative;
+}
+.zone-hold.uk .flag { background: #8d4a32; }
+.zone-hold.de .flag { background: #6d7f76; }
+.zone-hold.uk .flag::before,
+.zone-hold.de .flag::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: #f4e2b0;
+}
+.zone-hold.de .flag::before { background: #d7e4de; }
+.zone-hold span {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.obj-vp {
+  margin-left: auto;
+  color: #f0d48a;
+  font-family: Georgia, serif;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+.cover { perspective: 420px; }
+.cover-flip {
+  position: absolute;
+  inset: 0;
+  display: block;
+  border-radius: inherit;
+  transform-origin: center center;
+}
+.cover-flip.out { animation: cover-out 0.22s linear forwards; }
+.cover-flip.in { animation: cover-in 0.22s linear forwards; }
+@keyframes cover-out {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+@keyframes cover-in {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+.round-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 10px;
+  margin: 2px 0 8px;
+}
+.round-title {
+  margin: 0;
+  padding: 8px 12px;
+  background: #1b150f;
+  border: 1px solid rgba(215, 177, 90, 0.4);
+  font-family: Georgia, serif;
+  font-size: 16px;
+  line-height: 1.35;
+}
+.round-banner .initiative-pin { margin: 0; flex: 1 1 280px; }
+.seat-card { text-align: center; }
+.seat-portrait {
+  width: 160px;
+  height: 188px;
+  object-fit: contain;
+  object-position: center bottom;
+  display: block;
+  margin: 4px auto 8px;
+  filter: drop-shadow(0 10px 16px rgba(0, 0, 0, 0.45));
+}
+.seat-card h2 { font-size: 36px; margin-top: 4px; }
+.seat-card .primary { margin-top: 12px; }
+.die.tumbling { animation: die-tumble 0.42s ease-out; transform-origin: center center; }
+@keyframes die-tumble {
+  0% { transform: rotate(-18deg) scale(0.9); }
+  30% { transform: rotate(16deg) scale(1.06); }
+  60% { transform: rotate(-10deg) scale(0.96); }
+  100% { transform: rotate(0deg) scale(1); }
+}
+@keyframes hit-flash {
+  0% { filter: brightness(1.9); box-shadow: 0 0 0 3px #e7b2a4; }
+  45% { filter: brightness(1.4); box-shadow: 0 0 0 2px rgba(141, 51, 40, 0.75); }
+  100% { filter: none; box-shadow: none; }
+}
+.token.hit-flash, .cover.hit-flash, .prompt.hit-flash { animation: hit-flash 0.42s ease-out; }
+
 @media (prefers-reduced-motion: reduce) {
-  .mission-stamp, .kill-stamp { animation: none; }
+  .mission-stamp, .kill-stamp, .die.tumbling, .cover-flip.out, .cover-flip.in, .token.hit-flash, .cover.hit-flash, .prompt.hit-flash { animation: none; }
 }
 
 @media (max-width: 980px) {
