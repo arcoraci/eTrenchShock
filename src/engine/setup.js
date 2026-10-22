@@ -204,7 +204,7 @@ const FORMAT_NAMES = {
 function headquartersDifficulty(mode, value) {
   if (mode !== "solo") return null;
   if (value === "Easy" || value === "Difficult" || value === "Hard") return value;
-  return "Difficult";
+  return "Hard";
 }
 
 export function createGame(events, missions, options = {}) {
@@ -263,6 +263,8 @@ export function createGame(events, missions, options = {}) {
     missionPulse: [],
     killPulse: [],
     roundBrief: [],
+    fx: [],
+    fxSeq: 0,
   };
   buildSoldiers(state);
   buildEquipment(state);

@@ -20,6 +20,7 @@ import {
   canSoldierTarget,
   noteMoved,
   pushRoundBrief,
+  pushFx,
 } from "./core.js";
 import { beginInitiative } from "./setup.js";
 import {
@@ -134,30 +135,16 @@ function doRoll1(state) {
     state,
     `Roll 1 — Britain: ${comboLabel(state.players.uk.dice)}. Germany: ${comboLabel(state.players.de.dice)}. Wilds ignored.`,
   );
-  const queue = ["uk", "de"].filter((side) => hasGeneralOrder(state, side) && isInteractive(state, side));
-  for (const side of ["uk", "de"]) {
-    if (hasGeneralOrder(state, side) && !isInteractive(state, side)) autoGenerals(state, side);
-  }
+  const waiting = ["uk", "de"].filter((side) => hasGeneralOrder(state, side));
+  const queue = [
+    ...waiting.filter((side) => !isInteractive(state, side)),
+    ...waiting.filter((side) => isInteractive(state, side)),
+  ];
   if (queue.length) {
     state.pending = { type: "generals-order", side: queue[0], queue };
     return;
   }
   afterRoll1(state);
-}
-
-function autoGenerals(state, side) {
-  const p = state.players[side];
-  const card = p.eventHand.find((c) => c.title === "General's Order");
-  if (!card || p.generalsOrderUsed) return;
-  const boots = p.dice.filter((f) => f === "boot").length;
-  const wilds = p.dice.filter((f) => f === "wild").length;
-  if (boots + wilds >= 2) return;
-  const i = p.dice.findIndex((f) => f !== "boot" && f !== "wild");
-  if (i < 0) return;
-  p.dice[i] = "boot";
-  discardEvent(state, side, card.inst);
-  p.generalsOrderUsed = true;
-  log(state, `${labelSide(side)} plays General's Order and changes a die to Boot.`);
 }
 
 function doGeneralsOrder(state, action) {
@@ -507,6 +494,13 @@ function finishGambit(state, action) {
   advanceStep(state);
 }
 
+function soldiersKilledClause(count, zone) {
+  const place = ZONE_LABELS[zone];
+  if (count === 1) return `1 soldier killed in ${place}`;
+  if (count === 0) return `no soldiers killed in ${place}`;
+  return `${count} soldiers killed in ${place}`;
+}
+
 function mustardGas(state, side) {
   log(state, `${labelSide(side)} uses Shock: Mustard Gas.`);
   if (state.effects.christmasTruce) {
@@ -516,6 +510,7 @@ function mustardGas(state, side) {
   }
   const foe = other(side);
   const zones = [];
+  const clauses = [];
   let eliminated = 0;
   for (const zone of enemySideZones(side)) {
     const result = rollHits(state, 3);
@@ -525,11 +520,14 @@ function mustardGas(state, side) {
     eliminated += n;
     log(state, `Mustard Gas over ${ZONE_LABELS[zone]}: ${result.hits} Hit(s), ${n} eliminated.`);
     zones.push({ zone, faces: result.faces.slice(), hits: result.hits });
+    clauses.push(soldiersKilledClause(n, zone));
   }
+  pushFx(state, { kind: "gas", side, zones: zones.map((row) => row.zone) });
   if (eliminated) state.roundElim[side] = (state.roundElim[side] || 0) + eliminated;
   state.lastRoll = { kind: "mustard", zones };
   refreshControl(state);
   if (eliminated) checkMissions(state, side, { timing: "immediate" });
+  showBattleNotice(state, side, `${labelSide(side)}'s mustard gas: ${clauses.join(", ")}.`);
   clearAttackReadout(state);
 }
 
@@ -549,19 +547,23 @@ function moveTank(state, action) {
   }
   const steps = Math.max(0, Math.min(2, action.steps || 0));
   if (!steps) throw new Error("Choose how far the Tank advances.");
+  const path = [tank.loc];
   for (let n = 0; n < steps; n += 1) {
     const nxt = stepZone(tank.owner, tank.loc, "forward");
     if (!nxt) break;
     if (isBattlefield(nxt) && unitsIn(state, nxt, { side: other(tank.owner), type: "tank" }).length) {
       tank.loc = nxt;
+      path.push(nxt);
       log(state, `${labelSide(tank.owner)} Tank stops in ${ZONE_LABELS[nxt]} (enemy Tank).`);
       break;
     }
     if (nxt === enemyTrench(tank.owner)) {
+      path.push(nxt);
       state.vp[tank.owner] += 3;
       showBattleNotice(state, tank.owner, `${labelSide(tank.owner)} gains 3 victory points for the tank breakthrough.`);
       tank.loc = "supply";
       tank.damage = 0;
+      pushFx(state, { kind: "tank", unitId: tank.id, owner: tank.owner, path: path.slice(), breakthrough: true });
       refreshControl(state, { tankLeft: true });
       checkMissions(state, tank.owner, { timing: "immediate" });
       if (missionPaused(state, { kind: "finish-tank", tankId: tank.id })) return;
@@ -569,8 +571,12 @@ function moveTank(state, action) {
     }
     const left = tank.loc;
     tank.loc = nxt;
+    path.push(nxt);
     state.hadTank[left] = true;
     log(state, `${labelSide(tank.owner)} Tank advances to ${ZONE_LABELS[nxt]}.`);
+  }
+  if (path.length > 1) {
+    pushFx(state, { kind: "tank", unitId: tank.id, owner: tank.owner, path: path.slice(), breakthrough: false });
   }
   refreshControl(state);
   checkMissions(state, state.active, { timing: "immediate" });
@@ -1008,6 +1014,8 @@ function offerMortarHit(state, unit, zone) {
   const options = mortarOptions(state, side, zone);
   if (!options.length) {
     log(state, `Mortar hit on ${ZONE_LABELS[zone]} is lost. No eligible target.`);
+    noteMortarLanding(state, unit, zone);
+    showBattleNotice(state, side, mortarLandingText(side, zone, []));
     markMortarFired(state, unit, 0);
     return;
   }
@@ -1065,11 +1073,24 @@ function showBattleNotice(state, side, text) {
   state.killPulse.push({ id: state.killPulse.length, side, text });
 }
 
+function mortarOrigin(unit) {
+  if (unit && isBattlefield(unit.loc)) return unit.loc;
+  return ownTrench(unit?.owner);
+}
+
+function noteMortarLanding(state, unit, zone) {
+  if (!zone) return;
+  pushFx(state, { kind: "mortar", from: mortarOrigin(unit), zone, side: unit?.owner || null });
+}
+
+function mortarLandingText(side, zone, phrases) {
+  const detail = phrases.length ? phrases.join(", ") : "no soldiers killed";
+  return `${labelSide(side)}'s mortar hits ${ZONE_LABELS[zone]}: ${detail}.`;
+}
+
 function announceMortarHit(state, side, target, before) {
   const phrases = mortarEffectPhrases(state, target, before);
-  if (!phrases.length) return;
-  const text = `${labelSide(side)}'s mortar hits ${ZONE_LABELS[target.zone]}: ${phrases.join(", ")}.`;
-  showBattleNotice(state, side, text);
+  showBattleNotice(state, side, mortarLandingText(side, target.zone, phrases));
 }
 
 function applyMortarHit(state, unit, target) {
@@ -1077,6 +1098,7 @@ function applyMortarHit(state, unit, target) {
   log(state, `Mortar places 1 Hit on ${target.label} in ${ZONE_LABELS[target.zone]}.`);
   const before = rememberMortarTarget(state, target);
   applyHits(state, side, target, 1);
+  noteMortarLanding(state, unit, target.zone);
   announceMortarHit(state, side, target, before);
   markMortarFired(state, unit, 1, target);
 }

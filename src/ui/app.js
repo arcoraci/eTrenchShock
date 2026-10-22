@@ -16,6 +16,7 @@ import {
   capType,
   zoneDistance,
   clone,
+  presentFx,
   resetIds,
   smoked,
   canSoldierTarget,
@@ -48,6 +49,7 @@ import {
   ensureMatchId,
   buildBalanceWorkbook,
 } from "../export/ledger.js";
+import { GAME_VERSION } from "../version.js";
 
 const STEPS = [
   ["shock", "Shock"],
@@ -79,7 +81,8 @@ let killToast = null;
 let killQueue = [];
 let killTimer = 0;
 let killSerial = 0;
-let setup = { format: "standard", human: "uk", mode: "solo", undo: "off", difficulty: "Difficult" };
+const RESULT_NOTICE_MS = 5000;
+let setup = { format: "standard", human: "uk", mode: "solo", undo: "off", difficulty: "Hard" };
 let coverAsk = null;
 let ui = freshUi();
 const SAVE_KEY = "trench-shock-battle";
@@ -89,7 +92,13 @@ let menuNote = "";
 let menuConfirm = null;
 let menuLink = "";
 let updateBusy = false;
+let updateLeaving = false;
 const UPDATE_PAGE = "https://github.com/arcoraci/eTrenchShock";
+const UPDATE_NOTE_KEY = "trench-shock-update-note";
+
+function versionLabel() {
+  return `Version ${GAME_VERSION}`;
+}
 let savedStamp = null;
 let leaveAsk = null;
 let stepReturn = null;
@@ -275,6 +284,12 @@ function playThud() {
   });
 }
 
+function playHit() {
+  withAudio((ctx) => {
+    tone(ctx, 240, 0.045, "square", 0.05, 90);
+  });
+}
+
 function playStamp() {
   withAudio((ctx) => {
     tone(ctx, 180, 0.07, "triangle", 0.12, 90);
@@ -294,6 +309,437 @@ function resetPresentation() {
   window.clearTimeout(glanceTimer);
   glanceTimer = 0;
   glance = null;
+  clearFx();
+}
+
+let fxLive = [];
+let fxRaf = 0;
+let fxClaims = null;
+
+function clearFx() {
+  fxLive = [];
+  if (fxRaf) cancelAnimationFrame(fxRaf);
+  fxRaf = 0;
+  document.querySelector(".fx-layer")?.remove();
+  document.querySelectorAll(".fx-hidden").forEach((el) => el.classList.remove("fx-hidden"));
+}
+
+function fxSpan(beat) {
+  if (beat.kind === "mortar") return beat.motion === false ? 480 : 1200;
+  if (beat.kind === "gas") {
+    const n = Math.max(1, (beat.zones || []).length);
+    return Math.min(1300, 780 + (n - 1) * 160);
+  }
+  if (beat.kind === "elim") return 520;
+  if (beat.kind === "cover") return 560;
+  if (beat.kind === "charge") return 500;
+  if (beat.kind === "tank") {
+    const steps = Math.max(1, (beat.path || []).length - 1);
+    return Math.min(1200, 700 * steps + (beat.breakthrough ? 200 : 0));
+  }
+  return 600;
+}
+
+function noteFx(beforeIds, after) {
+  const seen = new Set(beforeIds || []);
+  const fresh = (after?.fx || []).filter((beat) => beat && !seen.has(beat.id));
+  if (!fresh.length) return;
+  const playable = presentFx(fresh, reducedMotion());
+  if (!playable.length) return;
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const impactHold = new Map();
+  const chargeHold = new Map();
+  let shells = 0;
+  for (const beat of playable) {
+    if (beat.kind === "mortar" && beat.motion !== false && beat.zone) {
+      impactHold.set(beat.zone, shells * 150 + 820);
+      shells += 1;
+    }
+    if (beat.kind === "charge" && beat.zone) chargeHold.set(beat.zone, 220);
+  }
+  shells = 0;
+  for (const beat of playable) {
+    let delay = 0;
+    if (beat.kind === "mortar") {
+      delay = shells * 150;
+      shells += 1;
+    }
+    let hold = 0;
+    if (beat.kind === "elim" || beat.kind === "cover") {
+      if (beat.zone && impactHold.has(beat.zone)) hold = Math.max(hold, impactHold.get(beat.zone) - delay);
+      if (beat.kind === "elim" && beat.zone && chargeHold.has(beat.zone)) hold = Math.max(hold, chargeHold.get(beat.zone));
+    }
+    fxLive.push({ ...beat, t0: now + delay, hold, life: hold + fxSpan(beat), trail: [] });
+  }
+  if (playable.some((beat) => beat.kind === "elim" || beat.kind === "cover")) playHit();
+}
+
+function fxProgress(beat, now) {
+  const elapsed = now - beat.t0;
+  if (elapsed < 0) return -1;
+  const hold = beat.hold || 0;
+  const span = Math.max(1, beat.life - hold);
+  if (elapsed <= hold) return 0;
+  return Math.min(1, (elapsed - hold) / span);
+}
+
+function kickFx() {
+  if (fxRaf || !fxLive.length) return;
+  fxRaf = requestAnimationFrame(fxFrame);
+}
+
+function zoneBox(id) {
+  const el = document.querySelector(`.zone[data-id="${id}"]`);
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) return null;
+  return {
+    cx: rect.left + rect.width / 2,
+    cy: rect.top + rect.height * 0.62,
+    w: rect.width,
+    h: rect.height,
+  };
+}
+
+function fxRand(seed, i) {
+  const x = Math.sin((seed || 1) * 12.9898 + i * 78.233) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+function fxLayer() {
+  let layer = document.querySelector("body > .fx-layer");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.className = "fx-layer";
+    layer.setAttribute("aria-hidden", "true");
+    const canvas = document.createElement("canvas");
+    canvas.className = "fx-canvas";
+    layer.appendChild(canvas);
+    document.body.appendChild(layer);
+  }
+  return layer;
+}
+
+function fxContext(layer) {
+  const canvas = layer.querySelector("canvas");
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  const pw = Math.max(1, Math.floor(w * dpr));
+  const ph = Math.max(1, Math.floor(h * dpr));
+  if (canvas.width !== pw || canvas.height !== ph) {
+    canvas.width = pw;
+    canvas.height = ph;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return ctx;
+}
+
+function fxGhost(layer, key, className) {
+  if (!fxClaims) fxClaims = new Set();
+  fxClaims.add(key);
+  let el = layer.querySelector(`[data-fx="${key}"]`);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = `fx-ghost ${className}`;
+    el.dataset.fx = key;
+    layer.appendChild(el);
+  }
+  return el;
+}
+
+function portrait(el, src) {
+  if (el.querySelector("img")) return;
+  const img = document.createElement("img");
+  img.alt = "";
+  img.draggable = false;
+  img.src = src;
+  el.appendChild(img);
+}
+
+function soldierSrc(owner) {
+  return owner === "de" ? "assets/soldier-german.png" : "assets/soldier-british.png";
+}
+
+function tankSrc(owner) {
+  return owner === "de" ? "assets/tank-german.png" : "assets/tank-british.png";
+}
+
+function flashZone(zoneId) {
+  const zone = document.querySelector(`.zone[data-id="${zoneId}"]`);
+  if (!zone || reducedMotion()) return;
+  zone.querySelectorAll(".token, .cover, .unit").forEach((el) => {
+    el.classList.remove("hit-flash");
+    void el.offsetWidth;
+    el.classList.add("hit-flash");
+  });
+}
+
+function syncHidden(now) {
+  document.querySelectorAll(".fx-hidden").forEach((el) => el.classList.remove("fx-hidden"));
+  for (const beat of fxLive) {
+    const u = fxProgress(beat, now);
+    if (u < 0 || u > 0.96) continue;
+    if (beat.kind === "tank" && !beat.breakthrough && beat.unitId) {
+      document.querySelector(`.unit[data-id="${beat.unitId}"]`)?.classList.add("fx-hidden");
+    }
+    if (beat.kind === "charge") {
+      for (const id of beat.soldierIds || []) {
+        document.querySelector(`.token[data-id="${id}"]`)?.classList.add("fx-hidden");
+      }
+    }
+  }
+}
+
+function drawMortar(ctx, beat, u) {
+  const to = zoneBox(beat.zone);
+  if (!to) return;
+  if (beat.motion === false) {
+    ctx.save();
+    ctx.translate(to.cx, to.cy);
+    ctx.strokeStyle = "rgba(232, 214, 170, 0.95)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, 16, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = "#241910";
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 10, 4, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#b08a45";
+    ctx.beginPath();
+    ctx.ellipse(8, -2, 3.5, 2.6, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    return;
+  }
+  const from = zoneBox(beat.from) || to;
+  const flightEnd = 0.68;
+  const t = Math.min(1, u / flightEnd);
+  const lift = Math.min(132, 68 + Math.abs(to.cx - from.cx) * 0.2);
+  const x = from.cx + (to.cx - from.cx) * t;
+  const y = from.cy + (to.cy - from.cy) * t - Math.sin(Math.PI * t) * lift;
+  if (t < 1) {
+    const last = beat.trail[beat.trail.length - 1];
+    if (!last || Math.hypot(x - last.x, y - last.y) > 6) beat.trail.push({ x, y });
+    if (beat.trail.length > 14) beat.trail.shift();
+  }
+  beat.trail.forEach((p, i) => {
+    const age = (i + 1) / beat.trail.length;
+    ctx.beginPath();
+    ctx.fillStyle = `rgba(92, 80, 64, ${0.12 + age * 0.28})`;
+    ctx.arc(p.x, p.y, 2 + age * 3.6, 0, Math.PI * 2);
+    ctx.fill();
+    if (i % 3 === 0) {
+      ctx.beginPath();
+      ctx.fillStyle = `rgba(214, 150, 70, ${age * 0.75})`;
+      ctx.arc(p.x + 3, p.y + 2, 1.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+  if (t < 1) {
+    const ahead = Math.min(1, t + 0.04);
+    const ax = from.cx + (to.cx - from.cx) * ahead;
+    const ay = from.cy + (to.cy - from.cy) * ahead - Math.sin(Math.PI * ahead) * lift;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(Math.atan2(ay - y, ax - x));
+    ctx.fillStyle = "#2a2118";
+    ctx.beginPath();
+    ctx.ellipse(-1, 0, 12, 4.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#c4a15a";
+    ctx.beginPath();
+    ctx.ellipse(9, 0, 4.2, 3.1, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#6b5332";
+    ctx.fillRect(-5, -3.4, 3.2, 6.8);
+    ctx.restore();
+  }
+  const burst = Math.max(0, (u - flightEnd) / (1 - flightEnd));
+  if (burst <= 0) return;
+  if (!beat.flashed) {
+    beat.flashed = true;
+    flashZone(beat.zone);
+  }
+  const fade = 1 - burst;
+  ctx.save();
+  ctx.translate(to.cx, to.cy);
+  ctx.beginPath();
+  ctx.fillStyle = `rgba(244, 226, 176, ${fade * 0.85})`;
+  ctx.arc(0, 0, 8 + burst * 22, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.strokeStyle = `rgba(232, 210, 160, ${fade})`;
+  ctx.lineWidth = 3;
+  ctx.arc(0, 0, 8 + burst * 58, 0, Math.PI * 2);
+  ctx.stroke();
+  for (let i = 0; i < 12; i += 1) {
+    const angle = fxRand(beat.id, i) * Math.PI * 2;
+    const speed = 16 + fxRand(beat.id, i + 20) * 42;
+    ctx.beginPath();
+    ctx.fillStyle = i % 2 ? `rgba(92, 70, 48, ${fade})` : `rgba(186, 164, 120, ${fade})`;
+    ctx.arc(Math.cos(angle) * speed * burst, Math.sin(angle) * speed * burst * 0.72, 1.6 + fxRand(beat.id, i + 40) * 2.4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawGas(ctx, beat, u) {
+  const span = Math.max(1, beat.life - (beat.hold || 0));
+  (beat.zones || []).forEach((id, i) => {
+    const box = zoneBox(id);
+    if (!box) return;
+    const start = (i * 160) / span;
+    const cloud = 760 / span;
+    const local = (u - start) / cloud;
+    if (local <= 0 || local >= 1) return;
+    const alpha = local < 0.22 ? local / 0.22 : 1 - (local - 0.22) / 0.78;
+    const drift = local * 22;
+    for (let p = 0; p < 5; p += 1) {
+      const rad = 18 + p * 7 + local * 10;
+      ctx.beginPath();
+      ctx.fillStyle = `rgba(${168 - p * 6}, ${152 - p * 8}, ${62 - p * 4}, ${alpha * 0.24})`;
+      ctx.ellipse(box.cx + (p - 2) * 16, box.cy - 16 - drift - p * 4, rad * 1.15, rad * 0.66, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+}
+
+function drawElim(layer, beat, u) {
+  const box = zoneBox(beat.zone);
+  if (!box) return;
+  const el = fxGhost(layer, `elim-${beat.id}`, "fx-soldier");
+  portrait(el, soldierSrc(beat.owner));
+  const tilt = (beat.owner === "de" ? 1 : -1) * u * 18;
+  el.style.left = `${box.cx - 23}px`;
+  el.style.top = `${box.cy - 28 + u * 40}px`;
+  el.style.opacity = String(1 - u * 0.95);
+  el.style.transform = `rotate(${tilt}deg)`;
+}
+
+function drawCoverBreak(ctx, beat, u) {
+  const box = zoneBox(beat.zone);
+  if (!box) return;
+  const crack = Math.min(1, u / 0.42);
+  const fade = u < 0.4 ? 1 : 1 - (u - 0.4) / 0.6;
+  ctx.save();
+  ctx.translate(box.cx, box.cy);
+  ctx.globalAlpha = Math.max(0, fade);
+  ctx.fillStyle = "#6d5138";
+  ctx.beginPath();
+  ctx.arc(0, 0, 22, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#1c140e";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-18 * crack, -6 * crack);
+  ctx.lineTo(2 * crack, 1 * crack);
+  ctx.lineTo(16 * crack, 14 * crack);
+  ctx.moveTo(-2 * crack, -18 * crack);
+  ctx.lineTo(3 * crack, -1 * crack);
+  ctx.lineTo(-12 * crack, 16 * crack);
+  ctx.stroke();
+  for (let i = 0; i < 8; i += 1) {
+    const angle = (i / 8) * Math.PI * 2 + 0.2;
+    const dist = u * (16 + (i % 3) * 12);
+    ctx.save();
+    ctx.translate(Math.cos(angle) * dist, Math.sin(angle) * dist);
+    ctx.rotate(angle + u * 2);
+    ctx.fillStyle = i % 2 ? "#8b6844" : "#3a2b1e";
+    ctx.fillRect(-5, -1.6, 10, 3.2);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function alongPath(path, t) {
+  const pts = (path || []).map((id) => zoneBox(id)).filter(Boolean);
+  if (!pts.length) return null;
+  if (pts.length === 1 || t <= 0) return pts[0];
+  const span = pts.length - 1;
+  const f = Math.min(0.999, t) * span;
+  const i = Math.min(span - 1, Math.floor(f));
+  const local = f - i;
+  const ease = local * local * (3 - 2 * local);
+  const a = pts[i];
+  const b = pts[i + 1];
+  return { cx: a.cx + (b.cx - a.cx) * ease, cy: a.cy + (b.cy - a.cy) * ease };
+}
+
+function drawTank(layer, ctx, beat, u) {
+  const travelPortion = beat.breakthrough ? 0.78 : 1;
+  const pt = alongPath(beat.path, Math.min(1, u / travelPortion));
+  if (!pt) return;
+  const el = fxGhost(layer, `tank-${beat.id}`, "fx-tank");
+  portrait(el, tankSrc(beat.owner));
+  const punch = beat.breakthrough && u > travelPortion;
+  const punchU = punch ? (u - travelPortion) / (1 - travelPortion) : 0;
+  el.style.left = `${pt.cx - 52}px`;
+  el.style.top = `${pt.cy - 36}px`;
+  el.style.opacity = String(punch ? Math.max(0, 1 - punchU) : 1);
+  el.style.transform = `scale(${punch ? 1 + Math.sin(punchU * Math.PI) * 0.18 : 1})`;
+  if (!punch) return;
+  ctx.save();
+  ctx.translate(pt.cx, pt.cy);
+  ctx.beginPath();
+  ctx.strokeStyle = `rgba(232, 206, 140, ${1 - punchU})`;
+  ctx.lineWidth = 3;
+  ctx.arc(0, 0, 12 + punchU * 48, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawCharge(layer, beat, u) {
+  const from = zoneBox(beat.from);
+  const to = zoneBox(beat.zone);
+  if (!from || !to) return;
+  (beat.soldierIds || []).forEach((id, i) => {
+    const shift = Math.min(0.24, i * 0.08);
+    const local = Math.min(1, Math.max(0, (u - shift) / (1 - shift)));
+    const el = fxGhost(layer, `charge-${beat.id}-${id}`, "fx-soldier");
+    portrait(el, soldierSrc(beat.owner));
+    const hop = Math.sin(Math.PI * local) * 16;
+    const x = from.cx + (to.cx - from.cx) * local + (i - 1) * 14;
+    const y = from.cy + (to.cy - from.cy) * local - hop;
+    el.style.left = `${x - 23}px`;
+    el.style.top = `${y - 28}px`;
+    el.style.opacity = "1";
+    el.style.transform = `rotate(${(beat.owner === "uk" ? -8 : 8) * (1 - local)}deg)`;
+  });
+}
+
+function fxFrame(now) {
+  fxRaf = 0;
+  try {
+    fxLive = fxLive.filter((beat) => now < beat.t0 + beat.life + 40);
+    if (!fxLive.length) {
+      clearFx();
+      return;
+    }
+    const layer = fxLayer();
+    const ctx = fxContext(layer);
+    fxClaims = new Set();
+    syncHidden(now);
+    for (const beat of fxLive) {
+      const u = fxProgress(beat, now);
+      if (u < 0) continue;
+      if (beat.kind === "mortar") drawMortar(ctx, beat, u);
+      else if (beat.kind === "gas") drawGas(ctx, beat, u);
+      else if (beat.kind === "elim") drawElim(layer, beat, u);
+      else if (beat.kind === "cover") drawCoverBreak(ctx, beat, u);
+      else if (beat.kind === "tank") drawTank(layer, ctx, beat, u);
+      else if (beat.kind === "charge") drawCharge(layer, beat, u);
+    }
+    layer.querySelectorAll("[data-fx]").forEach((el) => {
+      if (!fxClaims.has(el.dataset.fx)) el.remove();
+    });
+    fxRaf = requestAnimationFrame(fxFrame);
+  } catch {
+    clearFx();
+  }
 }
 
 function flicker(key, real, pool) {
@@ -640,6 +1086,7 @@ function commit(action, opts = {}) {
   const prev = actorSide();
   const beforePulse = (state?.missionPulse || []).map((pulse) => `${pulse.side}:${pulse.inst}`);
   const beforeKills = (state?.killPulse || []).map((note) => note.id);
+  const beforeFx = (state?.fx || []).map((beat) => beat.id);
   const allocFlash = assignmentTargets(action, state);
   const undoSnap = clone(state);
   if (state) ensureMatchId(state);
@@ -669,6 +1116,7 @@ function commit(action, opts = {}) {
   if (!state.error) noteJuice(undoSnap, state, action);
   if (!state.error && allocFlash) armHitFlash(allocFlash);
   if (!state.error) queueKillCelebration(beforeKills, state);
+  if (!state.error) noteFx(beforeFx, state);
   if (!state.error) queueMissionCelebration(beforePulse, state);
   if (!state.error && !opts.keepUi) {
     ui.card = null;
@@ -1126,7 +1574,7 @@ function revealMission() {
   missionTimer = window.setTimeout(() => {
     if (serial !== missionSerial) return;
     dismissMission();
-  }, 2000);
+  }, RESULT_NOTICE_MS);
 }
 
 function dismissMission() {
@@ -1190,7 +1638,7 @@ function revealKill() {
   killTimer = window.setTimeout(() => {
     if (serial !== killSerial) return;
     dismissKill();
-  }, 2000);
+  }, RESULT_NOTICE_MS);
 }
 
 function dismissKill() {
@@ -2814,8 +3262,8 @@ function confirmCopy() {
     return {
       title: "Update this game?",
       body: unfinished
-        ? "A newer version is available. An unfinished battle in this browser will still be there only if you saved it. A reload does not wipe localStorage saves, but it does leave the current on-screen battle."
-        : "A newer version is available. Reload the page after the update downloads.",
+        ? "A newer version is available. The page reloads when the download finishes. An unfinished battle in this browser will still be there only if you saved it. A reload does not wipe localStorage saves, but it does leave the current on-screen battle."
+        : "A newer version is available. The page reloads when the download finishes.",
       yes: "Update",
       kind: "menu-update-yes",
     };
@@ -2898,9 +3346,48 @@ function showZipUpdate(reason) {
   menuNote = `${reason} Download the latest ZIP:`;
 }
 
-function showUpdateStatus(data) {
+function takeUpdateNote() {
+  try {
+    const note = sessionStorage.getItem(UPDATE_NOTE_KEY) || "";
+    if (note) sessionStorage.removeItem(UPDATE_NOTE_KEY);
+    return note;
+  } catch {
+    return "";
+  }
+}
+
+function reloadGame(note) {
+  updateLeaving = true;
+  try {
+    sessionStorage.setItem(UPDATE_NOTE_KEY, note);
+  } catch {
+    /* The navigation still loads the current files. */
+  }
+  const url = new URL(location.href);
+  url.searchParams.set("v", String(Date.now()));
+  location.replace(url.href);
+}
+
+function updateReloadNote(data) {
+  const unfinished = Boolean(state && state.phase !== "end");
+  let note;
+  if (data.localNewer) note = "This copy already has newer local work than GitHub.";
+  else if (data.updated) note = "The update is downloaded. This page reloaded so you are playing it.";
+  else if (data.upToDate) note = "The game is already the latest.";
+  else note = data.message || "The game reloaded.";
+  if (unfinished) {
+    note += " An unfinished battle in this browser will still be there only if you saved it. A reload does not wipe localStorage saves, but it does leave the current on-screen battle.";
+  }
+  return note;
+}
+
+function finishUpdate(data) {
   menuLink = "";
   menuConfirm = null;
+  if (!data || typeof data !== "object") {
+    menuNote = "The update failed.";
+    return;
+  }
   if (data.git === false) {
     showZipUpdate("Git is missing, so this copy cannot update itself.");
     return;
@@ -2918,8 +3405,12 @@ function showUpdateStatus(data) {
     menuNote = "";
     return;
   }
-  if (data.upToDate) {
-    menuNote = "The game is already the latest.";
+  if (data.ok === false) {
+    menuNote = data.message || "The update failed.";
+    return;
+  }
+  if (data.reload || data.upToDate || data.localNewer || data.updated === true || data.updated === false) {
+    reloadGame(updateReloadNote(data));
     return;
   }
   menuNote = data.message || "Could not check for an update.";
@@ -2958,11 +3449,13 @@ async function checkForUpdate() {
       menuNote = "Could not check for an update.";
       return;
     }
-    showUpdateStatus(data);
+    finishUpdate(data);
   } finally {
-    updateBusy = false;
-    menuOpen = true;
-    render();
+    if (!updateLeaving) {
+      updateBusy = false;
+      menuOpen = true;
+      render();
+    }
   }
 }
 
@@ -2973,13 +3466,13 @@ async function runGameUpdate() {
   menuConfirm = null;
   menuLink = "";
   menuNote = "Updating the game…";
-  const unfinished = Boolean(state && state.phase !== "end");
   render();
   try {
     let response;
     try {
       response = await fetch("/local-update/pull", {
         method: "POST",
+        cache: "no-store",
         headers: { "X-Trench-Local": "1" },
       });
     } catch {
@@ -2996,23 +3489,13 @@ async function runGameUpdate() {
     } catch {
       data = null;
     }
-    if (!data || data.ok === false) {
-      if (data && data.git === false) showZipUpdate("Git is missing, so this copy cannot update itself.");
-      else if (data && data.clone === false) showZipUpdate("This copy is not a git clone, so it cannot update itself.");
-      else menuNote = (data && data.message) || "The update failed.";
-      return;
-    }
-    if (data.updated === false) {
-      menuNote = "The game is already the latest.";
-      return;
-    }
-    menuNote = unfinished
-      ? "The update is downloaded. Reload this page to play it. An unfinished battle in this browser will still be there only if you saved it. A reload does not wipe localStorage saves, but it does leave the current on-screen battle."
-      : "The update is downloaded. Reload this page to play it.";
+    finishUpdate(data);
   } finally {
-    updateBusy = false;
-    menuOpen = true;
-    render();
+    if (!updateLeaving) {
+      updateBusy = false;
+      menuOpen = true;
+      render();
+    }
   }
 }
 
@@ -3046,7 +3529,7 @@ function menuPanelHtml() {
     : menuActionsHtml(record);
   const note = menuNote ? `<p class="menu-note">${esc(menuNote)}</p>` : "";
   const link = menuLink ? `<p class="menu-note"><a href="${esc(menuLink)}">${esc(menuLink)}</a></p>` : "";
-  return `<div class="game-menu" id="game-menu" role="dialog" aria-label="Menu"><h2>Menu</h2>${soundControlHtml()}${body}<p class="menu-status">${esc(record ? saveSummary(record) : "No saved battle.")}</p>${note}${link}</div>`;
+  return `<div class="game-menu" id="game-menu" role="dialog" aria-label="Menu"><h2>Menu</h2><p class="game-version">${esc(versionLabel())}</p>${soundControlHtml()}${body}<p class="menu-status">${esc(record ? saveSummary(record) : "No saved battle.")}</p>${note}${link}</div>`;
 }
 
 function menuChrome() {
@@ -3278,6 +3761,7 @@ function render() {
   const mapLeft = map?.scrollLeft || 0;
   const sideTop = side?.scrollTop || 0;
   if (!state) {
+    clearFx();
     root.innerHTML = `${menuChrome()}${coverAsk ? coverPlaceHtml() : splashHtml()}`;
     return;
   }
@@ -3341,6 +3825,7 @@ function render() {
   if (nextBoard) nextBoard.scrollTop = boardTop;
   if (nextMap) nextMap.scrollLeft = mapLeft;
   if (nextSide) nextSide.scrollTop = sideTop;
+  if (fxLive.length) kickFx();
   scheduleEmptyAdvance();
 }
 
@@ -3409,7 +3894,7 @@ function helpHtml() {
       <li>On your turn: Shock, tank movement, events, deployment, movement, cover, then attacks. Empty steps are skipped.</li>
       <li>At regroup, the side that eliminated more soldiers scores 1 VP. Each side may exchange up to two unused dice for soldiers in the trench, then draws one event. After rounds 3, 6, and 9, each side also draws a mission.</li>
       <li>Before the first round, each side places one cover token in Zone 1, Zone 2, or Zone 3 on its own side. Headquarters places its cover in Zone 1.</li>
-      <li>Headquarters plays Easy, Difficult, or Hard. Difficult is the standard opponent. Pass and play does not use a difficulty.</li>
+      <li>Headquarters plays Easy, Hard, or Difficult. Hard is the standard opponent. Pass and play does not use a difficulty.</li>
       <li>A side completes at most one mission each round. If more than one is ready, that commander chooses which one scores. The others stay incomplete.</li>
     </ul>
     <h3>Dice</h3>
@@ -3440,11 +3925,12 @@ function splashHtml() {
   return `<div class="splash"><div class="splash-card">
     <div class="portraits"><div class="badge uk">${helmet("uk")}</div><div class="badge de">${helmet("de")}</div></div>
     <h1>Trench Shock</h1>
+    <p class="game-version">${esc(versionLabel())}</p>
     <p class="lede">A World War I battle of dice, cover, and missions. Roll your action dice, push infantry across no man's land, and hold the Objective Zone.</p>
     <div class="field"><p>Length</p><div class="choices">${choice("format", "short", "Short · 8 rounds")}${choice("format", "standard", "Standard · 10")}${choice("format", "extended", "Extended · 12")}</div></div>
     <div class="field"><p>Opposition</p><div class="choices">${choice("mode", "solo", "Headquarters")}${choice("mode", "hotseat", "Pass and play")}</div></div>
     <div class="field"><p>${setup.mode === "hotseat" ? "The table" : "You command"}</p>${sideChoices}</div>
-    ${setup.mode === "hotseat" ? "" : `<div class="field"><p>Difficulty</p><div class="choices">${choice("difficulty", "Easy", "Easy")}${choice("difficulty", "Difficult", "Difficult")}${choice("difficulty", "Hard", "Hard")}</div><p class="note">Headquarters plays this way. Difficult is the standard opponent.</p></div>`}
+    ${setup.mode === "hotseat" ? "" : `<div class="field"><p>Difficulty</p><div class="choices">${choice("difficulty", "Easy", "Easy")}${choice("difficulty", "Hard", "Hard")}${choice("difficulty", "Difficult", "Difficult")}</div><p class="note">Headquarters plays this way. Hard is the standard opponent.</p></div>`}
     <div class="field"><p>Undo</p><div class="choices">${choice("undo", "off", "Off")}${choice("undo", "on", "On")}</div><p class="note">On lets you take back the previous action. In pass and play, that closes when the other commander takes the seat.</p></div>
     <button type="button" class="primary" data-click="begin">Begin battle</button>
     <button type="button" class="ghost" data-click="help" style="margin-left:8px">How to play</button>
@@ -3503,6 +3989,13 @@ function launchBattle(coverZones) {
 }
 
 function onClick(event) {
+  if (killToast || missionToast) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (killToast) dismissKill();
+    else dismissMission();
+    return;
+  }
   const el = event.target.closest("[data-click]");
   if (!el) return;
   const kind = el.dataset.click;
@@ -3519,19 +4012,7 @@ function onClick(event) {
     backToSkipped();
     return;
   }
-  if (kind === "kill-done") {
-    event.preventDefault();
-    event.stopPropagation();
-    dismissKill();
-    return;
-  }
   if (leaveAsk || paused) return;
-  if (kind === "mission-done") {
-    event.preventDefault();
-    event.stopPropagation();
-    dismissMission();
-    return;
-  }
   if (kind === "setup") {
     setup[el.dataset.key] = el.dataset.value;
     render();
@@ -3828,6 +4309,13 @@ async function boot() {
     const result = simulateGames(catalog.events, catalog.missions, 20);
     root.innerHTML = `<pre class="sim">${esc(JSON.stringify(result, null, 2))}</pre>`;
     return;
+  }
+  const updateNote = takeUpdateNote();
+  if (updateNote) {
+    menuOpen = true;
+    menuConfirm = null;
+    menuLink = "";
+    menuNote = updateNote;
   }
   render();
 }

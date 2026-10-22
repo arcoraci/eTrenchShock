@@ -138,6 +138,21 @@ export function clone(state) {
   return structuredClone(state);
 }
 
+export function pushFx(state, beat) {
+  if (!state || !beat?.kind) return;
+  if (!Array.isArray(state.fx)) state.fx = [];
+  const id = (state.fxSeq || 0) + 1;
+  state.fxSeq = id;
+  state.fx.push({ id, ...beat });
+  if (state.fx.length > 48) state.fx.splice(0, state.fx.length - 48);
+}
+
+export function presentFx(beats, reduced) {
+  const list = Array.isArray(beats) ? beats.filter((beat) => beat && beat.kind) : [];
+  if (!reduced) return list.map((beat) => ({ ...beat, motion: true }));
+  return list.filter((beat) => beat.kind === "mortar").map((beat) => ({ ...beat, motion: false }));
+}
+
 export function log(state, text) {
   state.log.unshift({ round: state.round, text });
   if (state.log.length > 80) state.log.length = 80;

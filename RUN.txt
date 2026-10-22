@@ -55,8 +55,8 @@ Who you play
   "Pass the seat. The next commander is" Britain or Germany, hand the
   computer over and press "I am Britain" or "I am Germany".
   Headquarters is for one person. The screen says You command. Choose
-  Britain or Germany, set Difficulty to Easy, Difficult, or Hard, then
-  press Begin battle. Difficult is the standard opponent. Pass and play
+  Britain or Germany, set Difficulty to Easy, Hard, or Difficult, then
+  press Begin battle. Hard is the standard opponent. Pass and play
   does not ask.
 
 Stop

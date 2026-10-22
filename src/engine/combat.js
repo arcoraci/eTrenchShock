@@ -5,11 +5,14 @@ import {
   ownTrench,
   soldiersIn,
   ZONE_LABELS,
+  pushFx,
 } from "./core.js";
 
 export function eliminateSoldier(state, soldier) {
+  const zone = soldier.loc;
   soldier.coverId = null;
   soldier.loc = "casualties";
+  pushFx(state, { kind: "elim", soldierId: soldier.id, owner: soldier.owner, zone });
   log(state, `${labelSide(soldier.owner)} Soldier is eliminated.`);
 }
 
@@ -28,6 +31,7 @@ export function retreatSoldier(state, soldier) {
 }
 
 export function takeCoverTrophy(state, side, cover) {
+  pushFx(state, { kind: "cover", coverId: cover.id, zone: cover.loc, defense: cover.defense });
   cover.destroyed = true;
   cover.loc = "trophy";
   cover.trophyOwner = side;

@@ -14,6 +14,7 @@ import {
   refreshControl,
   nextSeed,
   noteMoved,
+  pushFx,
 } from "./core.js";
 import { rollHits, remaining } from "./dice.js";
 import { applyHits, eliminateSoldier } from "./combat.js";
@@ -147,10 +148,12 @@ function bayonetCharge(state, side, params) {
     const forward = stepZone(side, origin, "forward");
     dest = options.includes(forward) ? forward : options[0];
   }
+  const charged = soldiers.map((s) => s.id);
   for (const s of soldiers) {
     s.coverId = null;
     s.loc = dest;
   }
+  pushFx(state, { kind: "charge", owner: side, from: origin, zone: dest, soldierIds: charged });
   log(state, `${soldiers.length} Soldier(s) charge into ${ZONE_LABELS[dest]}.`);
   const first = rollHits(state, soldiers.length);
   const reroll = rollHits(state, first.faces.filter((f) => f === "miss").length);

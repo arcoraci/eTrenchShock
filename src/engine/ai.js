@@ -19,9 +19,8 @@ import {
   canSoldierTarget,
   SYMBOL_RANK,
   enemyTrench,
-  forwardPath,
 } from "./core.js";
-import { remaining, hasShock, naturalFaces, unusedDice } from "./dice.js";
+import { remaining, hasShock, naturalFaces, unusedDice, compareInitiative } from "./dice.js";
 import { eventNeeds, bayonetDestinations } from "./events.js";
 import { tanksReadyToMove } from "./game.js";
 import { preferredMissionAction } from "./missions.js";
@@ -31,7 +30,7 @@ const HOSTILE = new Set(["Bayonet Charge", "Bombing Run", "Heavy Barrage", "Snip
 function difficultyOf(state) {
   const value = state?.difficulty;
   if (value === "Easy" || value === "Difficult" || value === "Hard") return value;
-  return "Difficult";
+  return "Hard";
 }
 
 export function chooseAiAction(state) {
@@ -44,23 +43,18 @@ export function chooseAiAction(state) {
 function chooseDifficultAction(state) {
   const pending = state.pending || {};
   if (state.phase === "initiative" && pending.type === "roll1") return { type: "ROLL_1" };
-  if (pending.type === "generals-order") return { type: "SKIP_GENERALS_ORDER" };
-  if (pending.type === "spotter") {
-    return { type: "PICK_SPOTTER", face: pending.options[0] };
-  }
-  if (pending.type === "mortar-target") {
-    const pick = pending.options.find((o) => o.kind === "exposed") || pending.options[0];
-    return { type: "ALLOCATE_MORTAR", targetId: pick.id };
-  }
+  if (pending.type === "generals-order") return generalsOrderAction(state);
+  if (pending.type === "spotter") return { type: "PICK_SPOTTER", face: crowdedSpotterFace(state) };
+  if (pending.type === "mortar-target") return { type: "ALLOCATE_MORTAR", targetId: crowdedMortarTarget(state) };
   if (pending.type === "gambit" && pending.stage === "keep") {
     const best = pending.cards.slice().sort((a, b) => b.vp - a.vp)[0];
     return { type: "PICK_GAMBIT", inst: best.inst };
   }
   if (pending.type === "gambit") return { type: "FINISH_GAMBIT" };
-  if (pending.type === "allocate-hits") return { type: "ALLOCATE_HITS", auto: true };
+  if (pending.type === "allocate-hits") return stackHitAction(state);
   if (pending.type === "pick-mission") return preferredMissionAction(state);
-  if (state.phase === "reroll") return aiReroll(state, state.active);
-  if (state.phase === "action") return aiAction(state, state.active);
+  if (state.phase === "reroll") return difficultReroll(state, state.active);
+  if (state.phase === "action") return difficultAction(state, state.active);
   if (state.phase === "regroup") return aiRegroup(state, state.active);
   return null;
 }
@@ -181,7 +175,7 @@ function coverAction(state, side) {
   return { type: "SKIP_COVER" };
 }
 
-function pickEvent(state, side) {
+function pickEvent(state, side, reject) {
   if (remaining(state, side, "whistle") < 1) return null;
   const opened = state.players[side].eventsAtStep;
   const hand = state.players[side].eventHand.filter((c) => c.title !== "General's Order" && (!opened || opened.includes(c.inst)));
@@ -197,6 +191,7 @@ function pickEvent(state, side) {
     if (state.effects.christmasTruce && HOSTILE.has(title)) continue;
     const params = fillParams(state, side, card);
     if (!params) continue;
+    if (typeof reject === "function" && reject(card, params)) continue;
     return { type: "PLAY_EVENT", cardInst: card.inst, params };
   }
   return null;
@@ -440,7 +435,7 @@ function plannedMgAttack(state, side) {
   };
 }
 
-function pickAttack(state, side) {
+function pickAttack(state, side, aim) {
   if (state.effects.christmasTruce) return { type: "SKIP_ATTACK" };
   const foe = other(side);
   const p = state.players[side];
@@ -510,7 +505,9 @@ function pickAttack(state, side) {
   ));
   if (mortar) {
     const aimed = state.effects.precision.includes(mortar.id)
-      ? BATTLEFIELD.find((z) => soldiersIn(state, z, { side: foe, exposed: true }).length) || null
+      ? (aim === "crowd"
+        ? crowdedMortarZone(state, side)
+        : BATTLEFIELD.find((z) => soldiersIn(state, z, { side: foe, exposed: true }).length) || null)
       : null;
     if (state.effects.precision.includes(mortar.id) && !aimed) return { type: "SKIP_ATTACK" };
     return {
@@ -578,22 +575,15 @@ function chooseEasyAction(state) {
 function chooseHardAction(state) {
   const pending = state.pending || {};
   if (state.phase === "initiative" && pending.type === "roll1") return { type: "ROLL_1" };
-  if (pending.type === "generals-order") return { type: "SKIP_GENERALS_ORDER" };
-  if (pending.type === "spotter") return { type: "PICK_SPOTTER", face: pending.options[0] };
-  if (pending.type === "mortar-target") {
-    const options = pending.options || [];
-    const pick = options.find((o) => o.kind === "exposed" && o.zone === "obj")
-      || options.find((o) => o.zone === "obj" && o.kind !== "cover-empty")
-      || options.find((o) => o.kind === "exposed")
-      || options[0];
-    return { type: "ALLOCATE_MORTAR", targetId: pick.id };
-  }
+  if (pending.type === "generals-order") return generalsOrderAction(state);
+  if (pending.type === "spotter") return { type: "PICK_SPOTTER", face: crowdedSpotterFace(state) };
+  if (pending.type === "mortar-target") return { type: "ALLOCATE_MORTAR", targetId: crowdedMortarTarget(state) };
   if (pending.type === "gambit" && pending.stage === "keep") {
     const best = pending.cards.slice().sort((a, b) => b.vp - a.vp)[0];
     return { type: "PICK_GAMBIT", inst: best.inst };
   }
   if (pending.type === "gambit") return { type: "FINISH_GAMBIT" };
-  if (pending.type === "allocate-hits") return { type: "ALLOCATE_HITS", auto: true };
+  if (pending.type === "allocate-hits") return stackHitAction(state);
   if (pending.type === "pick-mission") return preferredMissionAction(state);
   if (state.phase === "reroll") return hardReroll(state, state.active);
   if (state.phase === "action") return hardAction(state, state.active);
@@ -605,18 +595,34 @@ function easyReroll(state, side) {
   return { type: "COMMIT", wildAs: showingFace(state.players[side].dice) };
 }
 
+function rerollKeep(dice) {
+  const high = dice.filter((face) => face === "bayonet" || face === "whistle").length;
+  return dice.map((face) => {
+    if (face === "wild" || face === "bayonet" || face === "whistle") return true;
+    if (face === "boot") return high >= 2;
+    return false;
+  });
+}
+
 function hardReroll(state, side) {
   const p = state.players[side];
-  if (!p.committed && p.rollsUsed < 3 && poolIsWeak(p.dice)) {
-    const high = p.dice.filter((face) => face === "bayonet" || face === "whistle").length;
-    const keep = p.dice.map((face) => {
-      if (face === "wild" || face === "bayonet" || face === "whistle") return true;
-      if (face === "boot") return high >= 2;
-      return false;
-    });
+  const missingBayonet = !p.dice.includes("bayonet");
+  const second = (p.rollsUsed || 0) >= 2;
+  const weak = poolIsWeak(p.dice) && !(second && missingBayonet);
+  if (!p.committed && p.rollsUsed < 3 && weak) {
+    const keep = rerollKeep(p.dice);
     if (keep.some((held) => !held)) return { type: "REROLL", keep };
   }
   return { type: "COMMIT", wildAs: highestFace(p.dice) };
+}
+
+function difficultReroll(state, side) {
+  const p = state.players[side];
+  if (!p.committed && p.rollsUsed < 3 && !p.dice.includes("bayonet")) {
+    const keep = p.dice.map((face) => face === "wild" || face === "whistle" || face === "bayonet");
+    if (keep.some((held) => !held)) return { type: "REROLL", keep };
+  }
+  return hardReroll(state, side);
 }
 
 function easyAction(state, side) {
@@ -634,24 +640,34 @@ function easyAction(state, side) {
   return { type: "SKIP_ATTACK" };
 }
 
+function crowdedShock(state, side) {
+  if (!hasShock(state, side)) return { type: "SKIP_SHOCK" };
+  const foe = other(side);
+  const crowded = enemySideZones(side).some((zone) => soldiersIn(state, zone, { side: foe, exposed: true }).length > 0);
+  return { type: "SHOCK", option: crowded ? "gas" : "gambit" };
+}
+
 function hardAction(state, side) {
   const step = state.actionStep;
-  if (step === "shock") {
-    if (hasShock(state, side)) {
-      const exposed = enemySideZones(side).reduce(
-        (n, zone) => n + soldiersIn(state, zone, { side: other(side), exposed: true }).length,
-        0,
-      );
-      return { type: "SHOCK", option: exposed >= 1 ? "gas" : "gambit" };
-    }
-    return { type: "SKIP_SHOCK" };
-  }
-  if (step === "tank") return hardTank(state, side);
+  if (step === "shock") return crowdedShock(state, side);
+  if (step === "tank") return plannedTankMove(state, side);
   if (step === "event") return hardEvent(state, side) || { type: "SKIP_EVENT" };
   if (step === "deploy") return hardDeploy(state, side);
   if (step === "move") return moveAction(state, side);
   if (step === "cover") return hardCover(state, side);
-  if (step === "attack") return hardAttack(state, side) || { type: "SKIP_ATTACK" };
+  if (step === "attack") return chooseShot(state, side, "hard") || { type: "SKIP_ATTACK" };
+  return { type: "SKIP_ATTACK" };
+}
+
+function difficultAction(state, side) {
+  const step = state.actionStep;
+  if (step === "shock") return crowdedShock(state, side);
+  if (step === "tank") return plannedTankMove(state, side);
+  if (step === "event") return difficultEvent(state, side) || { type: "SKIP_EVENT" };
+  if (step === "deploy") return difficultDeploy(state, side);
+  if (step === "move") return difficultMove(state, side);
+  if (step === "cover") return difficultCover(state, side);
+  if (step === "attack") return chooseShot(state, side, "difficult") || { type: "SKIP_ATTACK" };
   return { type: "SKIP_ATTACK" };
 }
 
@@ -661,19 +677,52 @@ function easyTank(state, side) {
   return { type: "MOVE_TANK", unitId: tank.id, steps: 1 };
 }
 
-function hardTank(state, side) {
-  const tanks = tanksReadyToMove(state, side);
-  if (!tanks.length) return { type: "SKIP_TANK" };
-  const tank = tanks.slice().sort((a, b) => stepsToTrench(side, a.loc) - stepsToTrench(side, b.loc))[0];
-  return { type: "MOVE_TANK", unitId: tank.id, steps: 2 };
+function tankStepPlan(state, side, tank) {
+  const foe = other(side);
+  const options = [];
+  for (const requested of [1, 2]) {
+    let loc = tank.loc;
+    let engaged = false;
+    let breakthrough = false;
+    let moved = 0;
+    for (let n = 0; n < requested; n += 1) {
+      const nxt = stepZone(side, loc, "forward");
+      if (!nxt) break;
+      const enemyTank = isBattlefield(nxt) && state.equipment.some((unit) => (
+        unit.owner === foe && unit.type === "tank" && unit.loc === nxt
+      ));
+      if (enemyTank) {
+        engaged = true;
+        moved = n + 1;
+        break;
+      }
+      if (nxt === enemyTrench(side)) {
+        breakthrough = true;
+        moved = n + 1;
+        break;
+      }
+      if (!isBattlefield(nxt)) break;
+      loc = nxt;
+      moved = n + 1;
+    }
+    if (moved > 0) options.push({ steps: moved, engaged, breakthrough });
+  }
+  const breach = options.find((option) => option.breakthrough);
+  if (breach) return { type: "MOVE_TANK", unitId: tank.id, steps: breach.steps, breakthrough: true };
+  const clear = options.filter((option) => !option.engaged).sort((a, b) => b.steps - a.steps);
+  if (clear[0]) return { type: "MOVE_TANK", unitId: tank.id, steps: clear[0].steps, breakthrough: false };
+  return null;
 }
 
-function stepsToTrench(side, loc) {
-  const path = forwardPath(side);
-  const here = path.indexOf(loc);
-  const trench = path.indexOf(enemyTrench(side));
-  if (here < 0 || trench < 0) return 99;
-  return trench - here;
+function plannedTankMove(state, side) {
+  const tanks = tanksReadyToMove(state, side);
+  if (!tanks.length) return { type: "SKIP_TANK" };
+  const plans = tanks.map((tank) => tankStepPlan(state, side, tank)).filter(Boolean);
+  const breach = plans.find((plan) => plan.breakthrough);
+  if (breach) return { type: "MOVE_TANK", unitId: breach.unitId, steps: breach.steps };
+  if (!plans.length) return { type: "SKIP_TANK" };
+  plans.sort((a, b) => b.steps - a.steps);
+  return { type: "MOVE_TANK", unitId: plans[0].unitId, steps: plans[0].steps };
 }
 
 function controlledZone(state, side, hunt) {
@@ -708,16 +757,23 @@ function easyDeploy(state, side) {
   return { type: "SKIP_DEPLOY" };
 }
 
-function gunIsClose(state, side, bayonets) {
-  const hold1 = controllerOf(state, ownZone1(side)) === side;
-  const ownHeld = sideZones(side).some((zone) => controllerOf(state, zone) === side);
-  if (supplyUnit(state, side, "tank") && bayonets === 3) return true;
-  if (supplyUnit(state, side, "mg") && ownHeld && bayonets === 2) return true;
-  if (supplyUnit(state, side, "mortar") && hold1 && bayonets === 1) return true;
-  return false;
+function hardDeploy(state, side) {
+  const bayonets = remaining(state, side, "bayonet");
+  if (!state.players[side].soldierDeployed && bayonets >= 1) {
+    const available = state.soldiers.some((soldier) => soldier.owner === side && soldier.loc === "available");
+    const zone = controlledZone(state, side, true);
+    if (available && zone) return { type: "DEPLOY", kind: "soldier", zone };
+  }
+  const damaged = state.equipment.find((unit) => unit.owner === side && isBattlefield(unit.loc) && unit.damage >= 1);
+  if (damaged && bayonets >= 1) return { type: "REPAIR", unitId: damaged.id };
+  const zone1 = ownZone1(side);
+  if (bayonets >= 2 && controllerOf(state, zone1) === side && supplyUnit(state, side, "mortar")) {
+    return { type: "DEPLOY", kind: "mortar", zone: zone1 };
+  }
+  return { type: "SKIP_DEPLOY" };
 }
 
-function hardDeploy(state, side) {
+function difficultDeploy(state, side) {
   const bayonets = remaining(state, side, "bayonet");
   if (bayonets >= 4 && supplyUnit(state, side, "tank")) return { type: "DEPLOY", kind: "tank" };
   const mgZone = sideZones(side).find((zone) => controllerOf(state, zone) === side);
@@ -728,7 +784,6 @@ function hardDeploy(state, side) {
   if (bayonets >= 2 && controllerOf(state, zone1) === side && supplyUnit(state, side, "mortar")) {
     return { type: "DEPLOY", kind: "mortar", zone: zone1 };
   }
-  if (gunIsClose(state, side, bayonets)) return { type: "SKIP_DEPLOY" };
   const damaged = state.equipment.find((unit) => unit.owner === side && isBattlefield(unit.loc) && unit.damage >= 1);
   if (damaged && bayonets >= 1) return { type: "REPAIR", unitId: damaged.id };
   if (!state.players[side].soldierDeployed && bayonets >= 1) {
@@ -832,11 +887,57 @@ function zoneThreatened(state, side, zone) {
   ));
 }
 
+function digAction(dig) {
+  return { type: "SHOVEL", mode: "dig", soldierId: dig.soldierId, coverId: dig.coverId };
+}
+
 function hardCover(state, side) {
   if (remaining(state, side, "shovel") < 1) return { type: "SKIP_COVER" };
-  const threatened = listDigs(state, side).find((dig) => zoneThreatened(state, side, dig.zone));
-  if (threatened) return { type: "SHOVEL", mode: "dig", soldierId: threatened.soldierId, coverId: threatened.coverId };
-  return coverAction(state, side);
+  const digs = listDigs(state, side).filter((dig) => dig.zone !== "obj");
+  const threatened = digs.find((dig) => zoneThreatened(state, side, dig.zone));
+  if (threatened) return digAction(threatened);
+  if (digs[0]) return digAction(digs[0]);
+  const action = coverAction(state, side);
+  if (action.type === "SHOVEL" && action.mode === "dig") return { type: "SKIP_COVER" };
+  return action;
+}
+
+function difficultCover(state, side) {
+  if (remaining(state, side, "shovel") < 1) return { type: "SKIP_COVER" };
+  const digs = listDigs(state, side);
+  const holding = digs.find((dig) => dig.zone === "obj");
+  if (holding) return digAction(holding);
+  const reachable = digs.find((dig) => zoneThreatened(state, side, dig.zone));
+  if (reachable) return digAction(reachable);
+  return hardCover(state, side);
+}
+
+function moveEmptiesObjective(state, side, soldier) {
+  if (!soldier || soldier.loc !== "obj") return false;
+  const friends = soldiersIn(state, "obj", { side }).filter((otherSoldier) => otherSoldier.id !== soldier.id);
+  const gear = state.equipment.some((unit) => (
+    unit.owner === side && unit.loc === "obj" && unit.type !== "tank" && unit.damage < 1
+  ));
+  return friends.length === 0 && !gear;
+}
+
+function difficultMove(state, side) {
+  if (remaining(state, side, "boot") < 1) return { type: "SKIP_MOVE" };
+  const foot = state.effects.trenchFoot && side !== state.effects.trenchFootBy;
+  if (!foot) {
+    const soldiers = state.soldiers.filter((soldier) => (
+      soldier.owner === side && !soldier.coverId && (isBattlefield(soldier.loc) || soldier.loc === ownTrench(side))
+    ));
+    soldiers.sort((a, b) => moveScore(state, side, a.loc) - moveScore(state, side, b.loc));
+    for (const soldier of soldiers) {
+      if (moveEmptiesObjective(state, side, soldier)) continue;
+      const dest = stepZone(side, soldier.loc, "forward");
+      if (dest && isBattlefield(dest)) {
+        return { type: "MOVE_UNIT", kind: "soldier", unitId: soldier.id, dir: "forward" };
+      }
+    }
+  }
+  return forwardWeapon(state, side);
 }
 
 function easyEvent(state, side) {
@@ -893,14 +994,59 @@ function simplerTarget(state, side, title) {
   return null;
 }
 
+function objectiveDefenders(state, side) {
+  return soldiersIn(state, "obj", { side: other(side) }).length;
+}
+
+function bayonetOntoObjective(state, side, thinOnly) {
+  if (remaining(state, side, "whistle") < 1) return null;
+  if (state.effects.christmasTruce) return null;
+  if (state.effects.trenchFoot && side !== state.effects.trenchFootBy) return null;
+  const opened = state.players[side].eventsAtStep;
+  const card = state.players[side].eventHand.find((entry) => (
+    entry.title === "Bayonet Charge" && (!opened || opened.includes(entry.inst))
+  ));
+  if (!card) return null;
+  if (thinOnly && objectiveDefenders(state, side) > 2) return null;
+  let best = null;
+  for (const zone of BATTLEFIELD) {
+    if (controllerOf(state, zone) !== side) continue;
+    if (!bayonetDestinations(state, side, zone).includes("obj")) continue;
+    const soldiers = soldiersIn(state, zone, { side });
+    if (!soldiers.length) continue;
+    const chosen = soldiers.slice(0, 3);
+    if (!best || chosen.length > best.count) {
+      best = {
+        count: chosen.length,
+        action: {
+          type: "PLAY_EVENT",
+          cardInst: card.inst,
+          params: { soldierIds: chosen.map((soldier) => soldier.id), zone: "obj" },
+        },
+      };
+    }
+  }
+  return best ? best.action : null;
+}
+
+function thickObjectiveCharge(state, side, card, params) {
+  return card?.title === "Bayonet Charge" && params?.zone === "obj" && objectiveDefenders(state, side) > 2;
+}
+
 function hardEvent(state, side) {
-  const action = pickEvent(state, side);
+  const thin = bayonetOntoObjective(state, side, true);
+  if (thin) return thin;
+  const action = pickEvent(state, side, (card, params) => thickObjectiveCharge(state, side, card, params));
   if (!action?.params) return action;
   const card = state.players[side].eventHand.find((entry) => entry.inst === action.cardInst);
   if (!card) return action;
   const zone = hardZone(state, side, card.title);
   if (!zone) return action;
   return { ...action, params: { ...action.params, zone } };
+}
+
+function difficultEvent(state, side) {
+  return bayonetOntoObjective(state, side, false) || hardEvent(state, side);
 }
 
 function hardZone(state, side, title) {
@@ -1073,12 +1219,177 @@ function hardTankOffers(state, side) {
   return offers;
 }
 
-function hardAttack(state, side) {
+function actionTarget(state, action) {
+  if (action?.target) return action.target;
+  if (action?.type === "OVERRUN") {
+    const tank = state.equipment.find((unit) => unit.id === action.unitId);
+    return { kind: "cover", zone: tank?.loc, coverId: action.coverId };
+  }
+  return {};
+}
+
+function shotDice(state, action) {
+  const target = actionTarget(state, action);
+  const ids = action.attackerIds || (action.unitId ? [action.unitId] : []);
+  let dice = 0;
+  for (const id of ids) {
+    if (state.soldiers.some((soldier) => soldier.id === id)) dice += 1;
+    else {
+      const unit = state.equipment.find((piece) => piece.id === id);
+      if (unit?.type === "mg") dice += target.zone === "obj" ? 4 : 3;
+      else if (unit?.type === "tank") dice += 3;
+    }
+  }
+  return dice;
+}
+
+function revealedCoverBreaks(state, action) {
+  const target = actionTarget(state, action);
+  if (target.kind !== "cover" || !target.coverId) return false;
+  const cover = state.covers.find((token) => token.id === target.coverId);
+  if (!cover?.revealed) return false;
+  return cover.defense <= shotDice(state, action);
+}
+
+function scoreShot(state, action, level) {
+  const target = actionTarget(state, action);
+  const onObj = target.zone === "obj";
+  const exposed = target.kind === "exposed";
+  const breakable = revealedCoverBreaks(state, action);
+  const bodies = (action.attackerIds || []).length || 1;
+  if (level === "difficult") {
+    let score = bodies;
+    if (onObj) score += 1000;
+    else if (breakable) score += 400;
+    else if (exposed) score += 30;
+    return score;
+  }
+  if (onObj && (exposed || breakable)) return 1000 + bodies;
+  if (exposed && !onObj) return 300 + bodies;
+  if (onObj) return 40 + bodies;
+  return bodies;
+}
+
+function chooseShot(state, side, level) {
   if (state.effects.christmasTruce) return { type: "SKIP_ATTACK" };
   const offers = [...hardInfantryOffers(state, side), ...hardTankOffers(state, side)];
   if (offers.length) {
+    offers.forEach((offer) => {
+      offer.score = scoreShot(state, offer.action, level);
+    });
     offers.sort((a, b) => b.score - a.score);
     return offers[0].action;
   }
-  return pickAttack(state, side);
+  return pickAttack(state, side, "crowd");
+}
+
+function mortarFaceZone(side, face) {
+  const zones = enemySideZones(side);
+  if (face === "z1") return zones[0];
+  if (face === "z2") return zones[1];
+  if (face === "z3") return zones[2];
+  return null;
+}
+
+function enemyCount(state, side, zone) {
+  if (!zone) return 0;
+  return soldiersIn(state, zone, { side: other(side) }).length;
+}
+
+function crowdedMortarZone(state, side) {
+  const rows = BATTLEFIELD.map((zone) => {
+    const n = enemyCount(state, side, zone);
+    const revealed = coversIn(state, zone).some((cover) => (
+      cover.revealed && soldiersIn(state, zone, { matchCover: true, coverId: cover.id }).some((soldier) => soldier.owner === other(side))
+    ));
+    return { zone, n, revealed };
+  }).filter((row) => row.n > 0 || row.revealed);
+  if (!rows.length) return null;
+  rows.sort((a, b) => b.n - a.n || Number(b.revealed) - Number(a.revealed));
+  return rows[0].zone;
+}
+
+function crowdedSpotterFace(state) {
+  const side = state.pending?.side;
+  const faces = state.pending?.options || [];
+  if (!faces.length) return null;
+  const ranked = faces.map((face) => ({ face, n: enemyCount(state, side, mortarFaceZone(side, face)) }));
+  ranked.sort((a, b) => b.n - a.n);
+  const crowded = ranked.find((row) => row.n > 0);
+  return (crowded || ranked[0]).face;
+}
+
+function crowdedMortarTarget(state) {
+  const options = state.pending?.options || [];
+  const exposed = options.find((option) => option.kind === "exposed");
+  if (exposed) return exposed.id;
+  const occupied = options.find((option) => option.kind === "cover" || option.kind === "mg" || option.kind === "mortar");
+  if (occupied) return occupied.id;
+  return options[0]?.id;
+}
+
+function stackHitAction(state) {
+  const pending = state.pending || {};
+  const options = pending.options || [];
+  const hits = pending.hits || 0;
+  if (!options.length || hits < 1) return { type: "ALLOCATE_HITS", auto: true };
+  const target = pending.target || {};
+  if (target.kind === "cover") {
+    const cover = state.covers.find((token) => token.id === target.coverId);
+    const focus = options[0];
+    if (!cover?.revealed) return { type: "ALLOCATE_HITS", picks: Array(hits).fill(focus.id) };
+    const defense = Math.max(0, Number(cover.defense) || 0);
+    const picks = [];
+    const soak = Math.min(hits, defense);
+    for (let i = 0; i < soak; i += 1) picks.push(focus.id);
+    let left = hits - soak;
+    let index = 0;
+    while (left > 0) {
+      picks.push(options[Math.min(index, options.length - 1)].id);
+      left -= 1;
+      if (index < options.length - 1) index += 1;
+    }
+    return { type: "ALLOCATE_HITS", picks };
+  }
+  if (target.kind === "exposed") {
+    const picks = [];
+    let index = 0;
+    while (picks.length < hits) {
+      picks.push(options[Math.min(index, options.length - 1)].id);
+      if (index < options.length - 1) index += 1;
+    }
+    return { type: "ALLOCATE_HITS", picks };
+  }
+  return { type: "ALLOCATE_HITS", picks: Array(hits).fill(options[0].id) };
+}
+
+function generalsOrderAction(state) {
+  const side = state.pending?.side;
+  if (!side) return { type: "SKIP_GENERALS_ORDER" };
+  const player = state.players[side];
+  const card = player.eventHand.find((entry) => entry.title === "General's Order");
+  if (!card || player.generalsOrderUsed) return { type: "SKIP_GENERALS_ORDER" };
+  const uk0 = state.players.uk.dice.slice();
+  const de0 = state.players.de.dice.slice();
+  const wins = (uk, de) => {
+    const cmp = compareInitiative(uk, de);
+    if (cmp > 0) return side === "uk";
+    if (cmp < 0) return side === "de";
+    return false;
+  };
+  if (wins(uk0, de0)) return { type: "SKIP_GENERALS_ORDER" };
+  const mine = (side === "uk" ? uk0 : de0).slice();
+  const natural = [...new Set(mine.filter((face) => face && face !== "wild"))];
+  for (let index = 0; index < mine.length; index += 1) {
+    for (const to of natural) {
+      if (mine[index] === to) continue;
+      if (!["boot", "whistle", "shovel", "bayonet"].includes(to)) continue;
+      const next = mine.slice();
+      next[index] = to;
+      const uk = side === "uk" ? next : uk0;
+      const de = side === "de" ? next : de0;
+      if (wins(uk, de)) return { type: "GENERALS_ORDER", side, mode: "change", index, to };
+    }
+  }
+  return { type: "SKIP_GENERALS_ORDER" };
 }
