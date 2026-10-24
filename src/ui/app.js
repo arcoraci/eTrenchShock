@@ -50,6 +50,9 @@ import {
   buildBalanceWorkbook,
 } from "../export/ledger.js";
 import { GAME_VERSION } from "../version.js";
+import { deployDrop, hitDrop, trenchMoveDrop } from "./gestures.js";
+import { REPLAY_KEY, boardShot, framesBetween, onBattleEnded, readReplay, replayEmptyMessage, trimTape } from "../engine/record.js";
+import { coverTutorialText, rememberTutorial, tutorialCard, tutorialStatus } from "./tutorial.js";
 
 const STEPS = [
   ["shock", "Shock"],
@@ -86,6 +89,14 @@ let setup = { format: "standard", human: "uk", mode: "solo", undo: "off", diffic
 let coverAsk = null;
 let ui = freshUi();
 const SAVE_KEY = "trench-shock-battle";
+let replayTape = [];
+let replayView = null;
+let tutorial = { arm: false, live: false, hidden: null };
+let tutorialOffer = false;
+let dragNotice = "";
+let dragNoticeTimer = 0;
+let pointerDrag = null;
+let swallowClick = false;
 let menuOpen = false;
 let paused = false;
 let menuNote = "";
@@ -297,6 +308,77 @@ function playStamp() {
   });
 }
 
+function noiseBurst(ctx, duration, freq, q, gain, delay = 0) {
+  const now = ctx.currentTime + delay;
+  const length = Math.max(1, Math.floor(ctx.sampleRate * duration));
+  const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  const filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.setValueAtTime(freq, now);
+  filter.Q.setValueAtTime(q, now);
+  const amp = ctx.createGain();
+  amp.gain.setValueAtTime(gain, now);
+  amp.gain.exponentialRampToValueAtTime(0.001, now + duration);
+  src.connect(filter);
+  filter.connect(amp);
+  amp.connect(ctx.destination);
+  src.start(now);
+  src.stop(now + duration + 0.02);
+}
+
+function playRifle() {
+  withAudio((ctx) => {
+    noiseBurst(ctx, 0.07, 1900, 0.7, 0.2);
+    tone(ctx, 160, 0.05, "square", 0.035, 70);
+  });
+}
+
+function playMg() {
+  withAudio((ctx) => {
+    for (let i = 0; i < 4; i += 1) noiseBurst(ctx, 0.04, 2100, 0.9, 0.14, i * 0.055);
+  });
+}
+
+function playTankShot() {
+  withAudio((ctx) => {
+    noiseBurst(ctx, 0.14, 220, 0.8, 0.28);
+    tone(ctx, 68, 0.18, "sine", 0.2, 34);
+  });
+}
+
+function playGas() {
+  withAudio((ctx) => {
+    noiseBurst(ctx, 0.42, 860, 0.45, 0.07);
+  });
+}
+
+function playStep() {
+  withAudio((ctx) => {
+    noiseBurst(ctx, 0.045, 240, 1.1, 0.14);
+    noiseBurst(ctx, 0.05, 180, 1, 0.12, 0.12);
+  });
+}
+
+function cueFromBeats(beats) {
+  const weapons = new Set();
+  let gas = false;
+  let step = false;
+  for (const beat of beats || []) {
+    if (beat.kind === "shot" && beat.weapon) weapons.add(beat.weapon);
+    if (beat.kind === "gas") gas = true;
+    if (beat.kind === "charge") step = true;
+  }
+  if (weapons.has("tank")) playTankShot();
+  if (weapons.has("mg")) playMg();
+  if (weapons.has("rifle")) playRifle();
+  if (gas) playGas();
+  if (step) playStep();
+}
+
 function resetPresentation() {
   window.clearTimeout(tumble?.timer);
   tumble = null;
@@ -333,6 +415,7 @@ function fxSpan(beat) {
   if (beat.kind === "elim") return 520;
   if (beat.kind === "cover") return 560;
   if (beat.kind === "charge") return 500;
+  if (beat.kind === "shot") return 820;
   if (beat.kind === "tank") {
     const steps = Math.max(1, (beat.path || []).length - 1);
     return Math.min(1200, 700 * steps + (beat.breakthrough ? 200 : 0));
@@ -344,18 +427,33 @@ function noteFx(beforeIds, after) {
   const seen = new Set(beforeIds || []);
   const fresh = (after?.fx || []).filter((beat) => beat && !seen.has(beat.id));
   if (!fresh.length) return;
+  cueFromBeats(fresh);
   const playable = presentFx(fresh, reducedMotion());
   if (!playable.length) return;
   const now = typeof performance !== "undefined" ? performance.now() : Date.now();
   const impactHold = new Map();
   const chargeHold = new Map();
+  const shotDelay = new Map();
+  const soldierArrive = new Map();
+  const coverArrive = new Map();
   let shells = 0;
+  let shotN = 0;
   for (const beat of playable) {
     if (beat.kind === "mortar" && beat.motion !== false && beat.zone) {
       impactHold.set(beat.zone, shells * 150 + 820);
       shells += 1;
     }
     if (beat.kind === "charge" && beat.zone) chargeHold.set(beat.zone, 220);
+    if (beat.kind === "shot" && beat.motion !== false) {
+      const delay = shotN * 35;
+      shotDelay.set(beat.id, delay);
+      shotN += 1;
+      if (beat.hit) {
+        const arrive = delay + Math.round(fxSpan(beat) * 0.75);
+        if (beat.soldierId) soldierArrive.set(beat.soldierId, Math.max(soldierArrive.get(beat.soldierId) || 0, arrive));
+        if (beat.coverId) coverArrive.set(beat.coverId, Math.max(coverArrive.get(beat.coverId) || 0, arrive));
+      }
+    }
   }
   shells = 0;
   for (const beat of playable) {
@@ -364,10 +462,17 @@ function noteFx(beforeIds, after) {
       delay = shells * 150;
       shells += 1;
     }
+    if (beat.kind === "shot") delay = shotDelay.get(beat.id) || 0;
     let hold = 0;
     if (beat.kind === "elim" || beat.kind === "cover") {
       if (beat.zone && impactHold.has(beat.zone)) hold = Math.max(hold, impactHold.get(beat.zone) - delay);
       if (beat.kind === "elim" && beat.zone && chargeHold.has(beat.zone)) hold = Math.max(hold, chargeHold.get(beat.zone));
+      if (beat.kind === "elim" && beat.soldierId && soldierArrive.has(beat.soldierId)) {
+        hold = Math.max(hold, soldierArrive.get(beat.soldierId) - delay);
+      }
+      if (beat.kind === "cover" && beat.coverId && coverArrive.has(beat.coverId)) {
+        hold = Math.max(hold, coverArrive.get(beat.coverId) - delay);
+      }
     }
     fxLive.push({ ...beat, t0: now + delay, hold, life: hold + fxSpan(beat), trail: [] });
   }
@@ -692,6 +797,87 @@ function drawTank(layer, ctx, beat, u) {
   ctx.restore();
 }
 
+function shotBox(selector) {
+  const el = document.querySelector(selector);
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) return null;
+  return { cx: rect.left + rect.width / 2, cy: rect.top + rect.height / 2 };
+}
+
+function shotAim(beat) {
+  if (beat.soldierId) {
+    const box = shotBox(`.token[data-id="${beat.soldierId}"]`);
+    if (box) return box;
+  }
+  if (beat.coverId) {
+    const box = shotBox(`.cover[data-id="${beat.coverId}"]`);
+    if (box) return box;
+  }
+  if (beat.unitId) {
+    const box = shotBox(`.unit[data-id="${beat.unitId}"]`);
+    if (box) return box;
+  }
+  const zone = zoneBox(beat.zone);
+  return zone ? { cx: zone.cx, cy: zone.cy } : null;
+}
+
+function drawShot(ctx, beat, u) {
+  const to = shotAim(beat);
+  if (!to) return;
+  const from = zoneBox(beat.from) || to;
+  const flightEnd = beat.hit ? 0.75 : 1;
+  const t = Math.min(1, u / flightEnd);
+  const arc = beat.weapon === "tank" ? 26 : beat.weapon === "mg" ? 4 : 12;
+  let x = from.cx + (to.cx - from.cx) * t;
+  let y = from.cy + (to.cy - from.cy) * t - Math.sin(Math.PI * Math.min(1, t)) * arc;
+  if (!beat.hit && t > 0.62) {
+    const over = (t - 0.62) / 0.38;
+    x += (to.cx - from.cx) * 0.38 * over || (beat.weapon === "tank" ? 18 : 28) * over;
+    y += (to.cy - from.cy) * 0.38 * over;
+  }
+  const fade = beat.hit ? 1 : 1 - Math.max(0, (t - 0.7) / 0.3);
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, fade);
+  ctx.translate(x, y);
+  if (beat.weapon === "tank") {
+    ctx.fillStyle = "#24180f";
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 8, 3.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#c4a15a";
+    ctx.beginPath();
+    ctx.ellipse(6, 0, 3, 2.2, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (beat.weapon === "mg") {
+    ctx.strokeStyle = "rgba(232, 214, 170, 0.95)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-8, 1);
+    ctx.lineTo(6, -1);
+    ctx.stroke();
+  } else {
+    ctx.strokeStyle = "#f0e2c4";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(-7, 0);
+    ctx.lineTo(5, 0);
+    ctx.stroke();
+  }
+  ctx.restore();
+  if (!beat.hit || u < flightEnd) return;
+  const spark = Math.min(1, (u - flightEnd) / (1 - flightEnd));
+  ctx.save();
+  ctx.translate(to.cx, to.cy);
+  ctx.globalAlpha = 1 - spark;
+  ctx.strokeStyle = "rgba(244, 226, 176, 0.9)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(0, 0, 4 + spark * 10, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawCharge(layer, beat, u) {
   const from = zoneBox(beat.from);
   const to = zoneBox(beat.zone);
@@ -728,6 +914,7 @@ function fxFrame(now) {
       if (u < 0) continue;
       if (beat.kind === "mortar") drawMortar(ctx, beat, u);
       else if (beat.kind === "gas") drawGas(ctx, beat, u);
+      else if (beat.kind === "shot") drawShot(ctx, beat, u);
       else if (beat.kind === "elim") drawElim(layer, beat, u);
       else if (beat.kind === "cover") drawCoverBreak(ctx, beat, u);
       else if (beat.kind === "tank") drawTank(layer, ctx, beat, u);
@@ -825,7 +1012,7 @@ function shownRollKey(game) {
   const roll = game?.lastRoll;
   if (!roll) return "";
   const pending = game.pending?.type;
-  const live = pending === "allocate-hits" || pending === "spotter" || pending === "mortar-target"
+  const live = pending === "allocate-hits" || pending === "spotter"
     || (roll.kind === "mustard" && game.phase === "action" && game.actionStep === "shock");
   if (!live) return "";
   if (roll.kind === "mustard") {
@@ -950,6 +1137,10 @@ function noteJuice(before, after, action) {
   }
   if (juice.whistle) playWhistle();
   if (juice.mortar) playThud();
+  if (action?.type === "MOVE_UNIT" && action.kind === "soldier") {
+    const soldier = before.soldiers?.find((item) => item.id === action.unitId);
+    if (soldier && soldier.loc === ownTrench(soldier.owner)) playStep();
+  }
 }
 
 function tumbleFreshDice(game) {
@@ -1082,6 +1273,7 @@ function commit(action, opts = {}) {
     actionCapture.push(action);
     return;
   }
+  dragNotice = "";
   const beforeStep = state?.actionStep;
   const prev = actorSide();
   const beforePulse = (state?.missionPulse || []).map((pulse) => `${pulse.side}:${pulse.inst}`);
@@ -1112,7 +1304,11 @@ function commit(action, opts = {}) {
     if (!state.error) stepReturn = null;
   }
   if (!state.error) trackUndo(action, undoSnap, state);
-  if (!state.error) noteBattleOutcome(state);
+  if (!state.error) {
+    replayTape = replayTape.concat(framesBetween(undoSnap, state));
+    maybeFinishTutorial(undoSnap, state);
+    noteBattleOutcome(state);
+  }
   if (!state.error) noteJuice(undoSnap, state, action);
   if (!state.error && allocFlash) armHitFlash(allocFlash);
   if (!state.error) queueKillCelebration(beforeKills, state);
@@ -1475,6 +1671,7 @@ function backToSkipped() {
   state = snap;
   holdEmpty = { step: state.actionStep, active: state.active, round: state.round };
   forgetUndoneResult(state);
+  replayTape = trimTape(replayTape, state);
   const tab = ui.tab;
   ui = freshUi();
   ui.tab = tab;
@@ -1511,6 +1708,7 @@ function undoLast() {
   holdEmpty = null;
   state = history.pop();
   forgetUndoneResult(state);
+  replayTape = trimTape(replayTape, state);
   const tab = ui.tab;
   ui = freshUi();
   ui.tab = tab;
@@ -1531,6 +1729,7 @@ function undoLastAction() {
   holdEmpty = null;
   state = snap;
   forgetUndoneResult(state);
+  replayTape = trimTape(replayTape, state);
   const tab = ui.tab;
   ui = freshUi();
   ui.tab = tab;
@@ -1603,10 +1802,19 @@ function queueMissionCelebration(before, after) {
   if (!missionToast && !killToast && !killQueue.length) revealMission();
 }
 
+function shellOrShotPlaying() {
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  return fxLive.some((beat) => {
+    if (!beat || (beat.kind !== "mortar" && beat.kind !== "shot")) return false;
+    return now < (beat.t0 || 0) + (beat.life || 0);
+  });
+}
+
 function missionHtml() {
   if (!missionToast) return "";
   const pulse = missionToast;
-  return `<div class="mission-celebrate" data-click="mission-done" role="dialog" aria-label="Mission complete">
+  const aside = shellOrShotPlaying();
+  return `<div class="mission-celebrate${aside ? " aside" : ""}" data-click="mission-done" role="${aside ? "status" : "dialog"}" aria-live="polite" aria-label="Mission complete">
     <div class="mission-stamp">
       <p class="mission-kicker">${esc(labelSide(pulse.side))} · Mission complete</p>
       <h3>${esc(pulse.title)}</h3>
@@ -1654,7 +1862,7 @@ function dismissKill() {
 function killHtml() {
   if (!killToast) return "";
   const note = killToast;
-  return `<div class="kill-celebrate" data-click="kill-done" role="dialog" aria-label="${esc(note.text)}">
+  return `<div class="kill-celebrate" data-click="kill-done" role="status" aria-live="polite" aria-label="${esc(note.text)}">
     <div class="kill-stamp">
       <p class="kill-line">${esc(note.text)}</p>
       <p class="mission-dismiss">Click to continue</p>
@@ -1780,7 +1988,14 @@ function soldierButton(soldier, inCover = false) {
   const mark = allocMark(soldier.id);
   const title = `${labelSide(soldier.owner)} soldier, ${inCover ? "in this cover" : "exposed"}${flag.className ? `, ${flag.className}` : ""}${mark.count ? `, ${mark.count} hit${mark.count === 1 ? "" : "s"} assigned` : ""}`;
   const flash = hitFlash?.ids?.has(soldier.id) ? "hit-flash" : "";
-  return `<button type="button" class="token ${soldier.owner} ${selected} ${targeted} ${flag.className} ${mark.on ? "alloc" : ""} ${flash} ${inCover ? "nested" : ""}" data-click="soldier" data-id="${soldier.id}" aria-label="${esc(title)}" title="${esc(title)}">${helmet(soldier.owner)}${flag.mark}</button>`;
+  const drag = trenchDraggable(soldier) ? ` data-drag="soldier"` : "";
+  return `<button type="button" class="token ${soldier.owner} ${selected} ${targeted} ${flag.className} ${mark.on ? "alloc" : ""} ${flash} ${inCover ? "nested" : ""}" data-click="soldier" data-id="${soldier.id}"${drag} aria-label="${esc(title)}" title="${esc(title)}">${helmet(soldier.owner)}${flag.mark}</button>`;
+}
+
+function trenchDraggable(soldier) {
+  if (!myTurn() || state?.actionStep !== "move" || state?.phase !== "action") return false;
+  if (!soldier || soldier.owner !== viewer()) return false;
+  return soldier.loc === ownTrench(soldier.owner) && !soldier.coverId;
 }
 
 function coverFightPreview(cover) {
@@ -1965,7 +2180,8 @@ function dieButton(side, face, index) {
   const enabled = Boolean(face) && (reroll || go || sabotage || deployPick);
   const title = spent ? "Used" : picked ? "Selected to spend" : deployPick ? "Select this bayonet" : display === "shovel" ? "Dig one soldier into cover" : "";
   const motion = spinning ? tumbleAttrs(key, "action", display, ACTION_POOL) : "";
-  return `<button type="button" class="${classes.filter(Boolean).join(" ")}" data-click="die" data-side="${side}" data-index="${index}" ${title ? `title="${title}"` : ""} ${picked ? `aria-pressed="true"` : ""} ${enabled ? "" : "disabled"}${motion}>${shownFace ? faceSvg(shownFace) : ""}<span>${esc(shown)}</span></button>`;
+  const drag = picked ? ` data-drag="dice"` : "";
+  return `<button type="button" class="${classes.filter(Boolean).join(" ")}" data-click="die" data-side="${side}" data-index="${index}"${drag} ${title ? `title="${title}"` : ""} ${picked ? `aria-pressed="true"` : ""} ${enabled ? "" : "disabled"}${motion}>${shownFace ? faceSvg(shownFace) : ""}<span>${esc(shown)}</span></button>`;
 }
 
 function selectedCard() {
@@ -1987,9 +2203,6 @@ function promptText() {
   const name = labelSide(me);
   if (state.pending?.type === "spotter") {
     return "Your spotter rolled the mortar die twice. Choose a zone. The mortar then places 1 hit on an eligible target there. It cannot strike the Objective.";
-  }
-  if (state.pending?.type === "mortar-target") {
-    return `The mortar die struck ${ZONE_LABELS[state.pending.zone]}. Place its 1 hit before cover defense is revealed.`;
   }
   if (state.pending?.type === "allocate-hits") {
     const pending = state.pending;
@@ -2073,7 +2286,6 @@ function phaseTitle() {
   if (state.pending?.type === "generals-order") return `${labelSide(me)} · General's Order`;
   if (state.pending?.type === "spotter") return `${labelSide(me)} · Spotter`;
   if (state.pending?.type === "gambit") return `${labelSide(me)} · Mission Gambit`;
-  if (state.pending?.type === "mortar-target") return `${labelSide(me)} · Mortar`;
   if (state.phase === "reroll") return `Reroll ${labelSide(state.active || me)}'s dice`;
   if (state.phase === "regroup") return `${labelSide(me)} · Regroup`;
   const step = STEPS.find(([id]) => id === state.actionStep);
@@ -2085,12 +2297,10 @@ function allocTarget(id) {
 }
 
 function addAllocHit(id) {
-  const pending = state.pending;
-  if (!allocTarget(id)) return;
-  const stack = ui.allocStack || [];
-  if (stack.length >= pending.hits) return;
-  ui.allocStack = [...stack, id];
-  armHitFlash({ ids: flashIdsFor(id), cover: Boolean(pending.target?.coverId) });
+  const drop = hitDrop(state.pending, ui.allocStack, id);
+  if (!drop.stack) return;
+  ui.allocStack = drop.stack;
+  armHitFlash({ ids: flashIdsFor(id), cover: Boolean(state.pending?.target?.coverId) });
   render();
 }
 
@@ -2159,13 +2369,6 @@ function actionList() {
       label: mortarName(me, face),
       primary: true,
       run: () => commit({ type: "PICK_SPOTTER", face }),
-    }));
-  }
-  if (state.pending?.type === "mortar-target") {
-    return state.pending.options.map((option) => ({
-      label: `1 hit on ${option.label}`,
-      primary: option.kind === "exposed",
-      run: () => commit({ type: "ALLOCATE_MORTAR", targetId: option.id }),
     }));
   }
   if (state.pending?.type === "allocate-hits") return hitAllocationButtons();
@@ -2431,7 +2634,10 @@ function deployButtons(me) {
       list.push({
         label: `Deploy a Soldier in ${ZONE_LABELS[zone]} (1)`,
         primary: list.length === 0,
-        run: () => commit({ type: "DEPLOY", kind: "soldier", zone, indexes }),
+        run: () => {
+          const drop = deployDrop(state, me, selectedBayonetIndexes(me), { kind: "soldier", zone });
+          if (drop.action) commit(drop.action);
+        },
       });
     }
     for (const unit of state.equipment) {
@@ -2439,7 +2645,10 @@ function deployButtons(me) {
         list.push({
           label: `Repair ${capType(unit.type)} (${unit.damage})`,
           primary: list.length === 0,
-          run: () => commit({ type: "REPAIR", unitId: unit.id, indexes }),
+          run: () => {
+            const drop = deployDrop(state, me, selectedBayonetIndexes(me), { kind: "repair", unitId: unit.id });
+            if (drop.action) commit(drop.action);
+          },
         });
       }
     }
@@ -2454,7 +2663,10 @@ function deployButtons(me) {
       list.push({
         label: "Deploy mortar into Zone 1",
         primary: true,
-        run: () => commit({ type: "DEPLOY", kind: "mortar", zone, indexes }),
+        run: () => {
+          const drop = deployDrop(state, me, selectedBayonetIndexes(me), { kind: "mortar" });
+          if (drop.action) commit(drop.action);
+        },
       });
     } else if (mortarsInSupply(state, me) <= 0) {
       deployNote = "The mortars are all deployed.";
@@ -2467,7 +2679,10 @@ function deployButtons(me) {
       list.push({
         label: `Deploy machine gun in ${ZONE_LABELS[zone]} (3)`,
         primary: list.length === 0,
-        run: () => commit({ type: "DEPLOY", kind: "mg", zone, indexes }),
+        run: () => {
+          const drop = deployDrop(state, me, selectedBayonetIndexes(me), { kind: "mg", zone });
+          if (drop.action) commit(drop.action);
+        },
       });
     }
     if (!list.length) {
@@ -2478,7 +2693,10 @@ function deployButtons(me) {
       list.push({
         label: "Deploy tank into Zone 1 (4)",
         primary: true,
-        run: () => commit({ type: "DEPLOY", kind: "tank", indexes }),
+        run: () => {
+          const drop = deployDrop(state, me, selectedBayonetIndexes(me), { kind: "tank" });
+          if (drop.action) commit(drop.action);
+        },
       });
     } else {
       deployNote = "The tanks are all deployed.";
@@ -2499,7 +2717,10 @@ function moveButtons(me) {
       list.push({
         label: "Advance to Zone 1 (1 boot)",
         primary: true,
-        run: () => commit({ type: "MOVE_UNIT", kind: "soldier", unitId: soldier.id, dir: "forward" }),
+        run: () => {
+          const drop = trenchMoveDrop(state, me, soldier.id, ownZone1(me));
+          if (drop.action) commit(drop.action);
+        },
       });
     }
   } else if (soldier && isBattlefield(soldier.loc)) {
@@ -2900,21 +3121,36 @@ function cardBlurb(card) {
   return [main, extra].filter(Boolean).join(" ");
 }
 
+function dockedConfirm(button) {
+  if (button.primary) return true;
+  if (STEP_LEAVE_LABELS.has(button.label)) return true;
+  return /^(Confirm|End |Keep the roll|Keep these missions|No, keep the roll|Commit)/.test(button.label);
+}
+
 function buttonRow(list) {
   buttons = list;
   const hintText = [attackHint, deployNote].filter(Boolean).join(" ");
   const hint = hintText ? `<div class="hint">${esc(hintText)}</div>` : "";
-  return `${hint}<div class="actions">${actionUndoButton()}${list.map((b, i) => `<button type="button" class="${b.primary ? "primary" : ""}" data-click="act" data-i="${i}"${b.hint ? ` data-tip="${esc(b.hint)}"` : ""}>${esc(b.label)}</button>`).join("")}</div>`;
+  const draw = (b, i) => `<button type="button" class="${b.primary ? "primary" : ""}" data-click="act" data-i="${i}"${b.hint ? ` data-tip="${esc(b.hint)}"` : ""}>${esc(b.label)}</button>`;
+  const pinned = [];
+  const rest = [];
+  list.forEach((b, i) => (dockedConfirm(b) ? pinned : rest).push(draw(b, i)));
+  if (!pinned.length && rest.length) pinned.push(rest.shift());
+  const pinBody = `${actionUndoButton()}${pinned.join("")}`;
+  const pin = pinBody ? `<div class="actions actions-pin">${pinBody}</div>` : "";
+  const more = rest.length ? `<div class="actions actions-more">${rest.join("")}</div>` : "";
+  return { hint, actions: `${pin}${more}` };
 }
 
-function attackDieFace(face, key) {
+function attackDieFace(face, key, drag = false) {
   const spinning = Boolean(key && tumble?.keys.has(key));
   const shown = spinning ? flicker(key, face, ATTACK_POOL) : face;
   const hit = shown === "hit";
   const src = ATTACK_ICON[hit ? "hit" : "miss"];
   const word = hit ? "Hit" : "Miss";
   const motion = spinning ? tumbleAttrs(key, "attack", face, ATTACK_POOL) : "";
-  return `<span class="die attack ${hit ? "hit" : "miss"}${spinning ? " tumbling" : ""}"${motion}><img src="${src}" alt="" draggable="false"><span>${word}</span></span>`;
+  const handle = drag && face === "hit" && !spinning ? ` data-drag="hit"` : "";
+  return `<span class="die attack ${hit ? "hit" : "miss"}${spinning ? " tumbling" : ""}"${handle}${motion}><img src="${src}" alt="" draggable="false"><span>${word}</span></span>`;
 }
 
 function mortarDieFace(face, key) {
@@ -2931,7 +3167,7 @@ function attackReadoutLive() {
   const roll = state.lastRoll;
   if (!roll) return false;
   const pending = state.pending?.type;
-  if (pending === "allocate-hits" || pending === "spotter" || pending === "mortar-target") return true;
+  if (pending === "allocate-hits" || pending === "spotter") return true;
   return roll.kind === "mustard" && state.phase === "action" && state.actionStep === "shock";
 }
 
@@ -2956,7 +3192,8 @@ function lastRoll() {
     return `<div class="dice-row"><span class="tag">Mortar</span>${roll.faces.map((face, index) => mortarDieFace(face, `mortar:${index}`)).join("")}</div>`;
   }
   const hits = roll.hits;
-  return `<div class="dice-row"><span class="tag">Attack</span>${roll.faces.map((face, index) => attackDieFace(face, `attack:${index}`)).join("")}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"} · 3 Hit / 3 Miss</span></div>`;
+  const dragHits = state.pending?.type === "allocate-hits";
+  return `<div class="dice-row"><span class="tag">Attack</span>${roll.faces.map((face, index) => attackDieFace(face, `attack:${index}`, dragHits)).join("")}<span class="quiet">${hits} hit${hits === 1 ? "" : "s"} · 3 Hit / 3 Miss</span></div>`;
 }
 
 function stepRail() {
@@ -2997,15 +3234,15 @@ function sidebar() {
     <h3>Opponent</h3><p class="quiet">${labelSide(foe.side)} holds ${foe.eventHand.length} event${foe.eventHand.length === 1 ? "" : "s"}.</p></div>`;
 }
 
-function supplyToken(src, count, label) {
-  return `<div class="supply-token" title="${esc(label)} ${count}"><img src="${src}" alt="" draggable="false"><b>${count}</b><span>${esc(label)}</span></div>`;
+function supplyToken(src, count, label, kind) {
+  return `<div class="supply-token" data-drop="supply" data-kind="${kind}" title="${esc(label)} ${count}"><img src="${src}" alt="" draggable="false"><b>${count}</b><span>${esc(label)}</span></div>`;
 }
 
 function supplyLine() {
   const me = viewer();
   const soldier = me === "de" ? "assets/soldier-german.png" : "assets/soldier-british.png";
   const tank = me === "de" ? "assets/tank-german.png" : "assets/tank-british.png";
-  return `<div class="supply-row" aria-label="Supply">${supplyToken(soldier, countAt(me, "available"), "Soldiers")}${supplyToken("assets/mortar.png", mortarsInSupply(state, me), "Mortars")}${supplyToken("assets/machine-gun.png", machineGunsInSupply(state, me), "Machine guns")}${supplyToken(tank, tanksInSupply(state, me), "Tanks")}${supplyToken("assets/cover-token.jpg", state.coverSupply.length, "Cover")}</div>`;
+  return `<div class="supply-row" aria-label="Supply">${supplyToken(soldier, countAt(me, "available"), "Soldiers", "soldier")}${supplyToken("assets/mortar.png", mortarsInSupply(state, me), "Mortars", "mortar")}${supplyToken("assets/machine-gun.png", machineGunsInSupply(state, me), "Machine guns", "mg")}${supplyToken(tank, tanksInSupply(state, me), "Tanks", "tank")}${supplyToken("assets/cover-token.jpg", state.coverSupply.length, "Cover", "cover")}</div>`;
 }
 
 function ledgerStats() {
@@ -3018,13 +3255,31 @@ function ledgerStats() {
   return summarize(games);
 }
 
+function victoryFlag(side) {
+  const german = side === "de";
+  const src = german ? "assets/flag-german.png" : "assets/flag-british.png";
+  const alt = german ? "German flag" : "British flag";
+  return `<img class="victory-flag" src="${src}" alt="${alt}">`;
+}
+
+function victoryBanner() {
+  if (state.phase !== "end") return "";
+  const score = esc(`Britain ${state.vp.uk} · Germany ${state.vp.de}`);
+  if (!state.winner) {
+    return `<section class="victory-banner draw" aria-label="The battle is a draw">${victoryFlag("uk")}<div class="victory-words"><h2>The battle is a draw</h2><p>${score}</p></div>${victoryFlag("de")}</section>`;
+  }
+  const side = state.winner === "de" ? "de" : "uk";
+  const name = labelSide(side);
+  return `<section class="victory-banner ${side}" aria-label="${esc(name)} wins">${victoryFlag(side)}<div class="victory-words"><h2>${esc(name)} wins</h2><p>${score}</p></div></section>`;
+}
+
 function resultBanner() {
   if (state.phase !== "end") return "";
   const title = state.winner ? `${labelSide(state.winner)} wins` : "The battle is a draw";
   const stats = ledgerStats();
   const games = `${stats.played} ${stats.played === 1 ? "game" : "games"}`;
   const totals = `${games} · Britain ${stats.britain} · Germany ${stats.germany} · Draws ${stats.draws}`;
-  return `<div class="result"><strong>${title}</strong><span>${state.vp.uk}–${state.vp.de} · ${esc(state.tiebreak || "")}</span><button type="button" class="primary" data-click="new">New battle</button><button type="button" data-click="export-excel">Export to Excel</button><span class="ledger-totals">${esc(totals)}</span></div>`;
+  return `<div class="result"><strong>${title}</strong><span>${state.vp.uk}–${state.vp.de} · ${esc(state.tiebreak || "")}</span><button type="button" class="primary" data-click="new">New battle</button><button type="button" data-click="replay">Replay</button><button type="button" data-click="export-excel">Export to Excel</button><span class="ledger-totals">${esc(totals)}</span></div>`;
 }
 
 function showCardTip(el) {
@@ -3156,6 +3411,15 @@ function leaveToSetup() {
   clearEmptyTimer();
   resetPresentation();
   coverMemory = null;
+  if (tutorial.live) {
+    try { rememberTutorial(localStorage, "skipped"); } catch { /* The table still clears. */ }
+  }
+  tutorial.live = false;
+  tutorial.arm = false;
+  tutorial.hidden = null;
+  tutorialOffer = false;
+  replayTape = [];
+  replayView = null;
   state = null;
   coverAsk = null;
   history = [];
@@ -3187,6 +3451,14 @@ function applyLoad(record) {
   emptyMemo = null;
   state = record.state;
   adoptIds(state);
+  if (state.pending?.type === "mortar-target") state = runUntilHuman(state);
+  replayTape = [{
+    kind: "start",
+    text: "The battle resumes from the saved position.",
+    board: boardShot(state),
+    logSize: state.log?.length || 0,
+  }];
+  replayView = null;
   restoreSetup(record);
   ui = freshUi();
   ui.tab = record.tab === "missions" || record.tab === "log" ? record.tab : "events";
@@ -3257,6 +3529,14 @@ function confirmCopy() {
       kind: "menu-new-yes",
     };
   }
+  if (menuConfirm === "tutorial") {
+    return {
+      title: "Leave for the tutorial?",
+      body: "This battle has not been saved. You will return to the start screen, and the tutorial starts when you begin.",
+      yes: "Tutorial",
+      kind: "menu-tutorial-yes",
+    };
+  }
   if (menuConfirm === "update") {
     const unfinished = state && state.phase !== "end";
     return {
@@ -3278,8 +3558,12 @@ function confirmCopy() {
 
 function noteBattleOutcome(game) {
   if (!game || game.phase !== "end") return;
+  if (!replayTape.some((frame) => frame.kind === "end")) {
+    const text = game.winner ? `${labelSide(game.winner)} wins the battle.` : "The battle is a draw.";
+    replayTape.push({ kind: "end", text, board: boardShot(game), logSize: game.log?.length || 0 });
+  }
   try {
-    recordFinished(localStorage, game);
+    onBattleEnded(localStorage, replayTape, game);
   } catch {
     /* The battle stands even if this browser cannot store the ledger. */
   }
@@ -3291,6 +3575,12 @@ function forgetUndoneResult(game) {
     dropIfUnfinished(localStorage, game);
   } catch {
     /* Undoing the battle still works if the ledger cannot be updated. */
+  }
+  try {
+    const saved = readReplay(localStorage);
+    if (saved && game.matchId && saved.matchId === game.matchId) localStorage.removeItem(REPLAY_KEY);
+  } catch {
+    /* The undone battle still returns to the table. */
   }
 }
 
@@ -3504,7 +3794,8 @@ function menuActionsHtml(record) {
   const drop = `<button type="button" data-click="menu-delete"${record ? "" : " disabled"}>Delete save</button>`;
   const excel = `<button type="button" data-click="export-excel">Export to Excel</button>`;
   const update = `<button type="button" data-click="menu-update"${updateBusy ? " disabled" : ""}>Update game</button>`;
-  if (!state) return `${load}${drop}${excel}${update}`;
+  const guide = `<button type="button" data-click="menu-tutorial">Tutorial</button><button type="button" data-click="menu-replay">Replay</button>`;
+  if (!state) return `${load}${drop}${excel}${guide}${update}`;
   return `<button type="button" class="primary" data-click="menu-resume">Resume</button>
     <button type="button" data-click="menu-pause"${paused ? " disabled" : ""}>Pause</button>
     <button type="button" data-click="menu-save">Save</button>
@@ -3512,6 +3803,7 @@ function menuActionsHtml(record) {
     ${load}
     <button type="button" data-click="menu-new">New game</button>
     <button type="button" data-click="menu-quit">Quit</button>
+    ${guide}
     ${drop}
     ${update}`;
 }
@@ -3545,6 +3837,21 @@ function handleMenu(kind) {
   if (kind === "menu-sound") {
     setSoundEnabled(!soundEnabled());
     render();
+    return true;
+  }
+  if (kind === "menu-tutorial") {
+    if (state && state.phase !== "end" && unsavedBattle()) {
+      menuOpen = true;
+      menuConfirm = "tutorial";
+      menuNote = "";
+      render();
+      return true;
+    }
+    startTutorialSetup();
+    return true;
+  }
+  if (kind === "menu-tutorial-yes") {
+    startTutorialSetup();
     return true;
   }
   if (kind === "pause-hold") return true;
@@ -3711,10 +4018,398 @@ function emptyStepView() {
   return view;
 }
 
+function tutorialSubject(game) {
+  if (!game) return null;
+  return game.mode === "hotseat" ? (game.player1 || game.human) : game.human;
+}
+
+function maybeFinishTutorial(before, after) {
+  if (!tutorial.live || !before) return;
+  const subject = tutorialSubject(before);
+  if (before.phase !== "action" || before.actionStep !== "attack" || before.active !== subject) return;
+  const pending = after?.pending?.type;
+  if (pending === "allocate-hits" || pending === "mortar-target" || pending === "spotter" || pending === "pick-mission" || pending === "gambit") return;
+  if (after?.phase === "action" && after.actionStep === "attack" && after.active === subject) return;
+  tutorial.live = false;
+  tutorial.arm = false;
+  tutorial.hidden = null;
+  try { rememberTutorial(localStorage, "done"); } catch { /* The battle continues either way. */ }
+}
+
+function currentTutorialCard() {
+  if (!tutorial.live || !state) return null;
+  const card = tutorialCard(state);
+  if (!card || tutorial.hidden === card.id) return null;
+  return card;
+}
+
+function tutorialHtml() {
+  const card = currentTutorialCard();
+  if (!card) return "";
+  return `<aside class="tutorial-card" role="note" aria-label="Tutorial"><p>${esc(card.text)}</p><div class="tutorial-actions"><button type="button" class="primary" data-click="tutorial-next">Next</button><button type="button" data-click="tutorial-skip">Skip</button><button type="button" data-click="tutorial-close" aria-label="Close tutorial">Close</button></div></aside>`;
+}
+
+function tutorialOfferHtml() {
+  if (tutorial.arm || !tutorialOffer) return "";
+  try {
+    if (tutorialStatus(localStorage) !== "") return "";
+  } catch {
+    /* Show the offer when storage cannot be read. */
+  }
+  return `<aside class="tutorial-offer" role="dialog" aria-label="Tutorial"><p>A short tutorial walks one opening round on this board. You make every choice, and the dice are not rigged.</p><div class="tutorial-actions"><button type="button" class="primary" data-click="tutorial-start">Start tutorial</button><button type="button" data-click="tutorial-skip">Skip</button><button type="button" data-click="tutorial-close" aria-label="Close tutorial">Close</button></div></aside>`;
+}
+
+function startTutorialSetup() {
+  leaveToSetup();
+  tutorial.arm = true;
+  tutorialOffer = false;
+  render();
+}
+
+function handleTutorial(kind) {
+  if (kind === "tutorial") {
+    tutorial.arm = !tutorial.arm;
+    tutorialOffer = false;
+    render();
+    return;
+  }
+  if (kind === "tutorial-start") {
+    tutorial.arm = true;
+    tutorialOffer = false;
+    ui.help = false;
+    coverAsk = { side: setup.mode === "hotseat" ? "uk" : setup.human, uk: null, de: null };
+    render();
+    return;
+  }
+  if (kind === "tutorial-next") {
+    const card = currentTutorialCard();
+    if (card) tutorial.hidden = card.id;
+    render();
+    return;
+  }
+  if (kind === "tutorial-skip" || kind === "tutorial-close") {
+    tutorialOffer = false;
+    tutorial.live = false;
+    tutorial.arm = false;
+    tutorial.hidden = null;
+    try { rememberTutorial(localStorage, "skipped"); } catch { /* The card still closes. */ }
+    if (!state) coverAsk = null;
+    render();
+  }
+}
+
+function withView(game, fn) {
+  const saved = state;
+  state = game;
+  try {
+    return fn();
+  } finally {
+    state = saved;
+  }
+}
+
+function replayGame(frame) {
+  const board = frame?.board || {};
+  const blank = () => ({
+    attackedIds: [],
+    firedEquip: [],
+    movedIds: [],
+    movedEquip: [],
+    movedTanks: [],
+    dice: [],
+    eventHand: [],
+    missionHand: [],
+    completedMissions: [],
+    destroyedCover: [],
+  });
+  return {
+    soldiers: board.soldiers || [],
+    equipment: board.equipment || [],
+    covers: board.covers || [],
+    effects: { smoke: board.smoke || [] },
+    players: { uk: blank(), de: blank() },
+    vp: board.vp || { uk: 0, de: 0 },
+    round: board.round || 1,
+    maxRounds: state?.maxRounds || 10,
+    phase: "end",
+    pending: null,
+    actionStep: null,
+    mode: "solo",
+    human: "uk",
+    initiative: board.initiative || null,
+    log: [{ round: board.round || 1, text: frame?.text || "" }],
+    winner: board.winner || null,
+    tiebreak: board.tiebreak || "",
+  };
+}
+
+function replayBoardHtml(frame) {
+  const savedZone = ui.zone;
+  ui.zone = null;
+  try {
+    return withView(replayGame(frame), () => TRENCH_LINE.map(renderZone).join(""));
+  } finally {
+    ui.zone = savedZone;
+  }
+}
+
+function replayHtml() {
+  const frames = replayView?.frames || [];
+  if (!frames.length) {
+    return `<div class="splash"><div class="splash-card replay-card"><h1>Replay</h1><p class="lede">${esc(replayEmptyMessage())}</p><button type="button" class="primary" data-click="replay-exit">Back</button></div></div>`;
+  }
+  const index = Math.max(0, Math.min(replayView.index || 0, frames.length - 1));
+  replayView.index = index;
+  const frame = frames[index];
+  const board = frame.board || {};
+  const score = `${board.vp?.uk ?? 0}–${board.vp?.de ?? 0}`;
+  return `<div class="app replay-app">
+    <header class="topbar"><div class="brand"><h1>Replay</h1><span>Round ${esc(board.round || 1)} · ${esc(score)}</span></div>
+      <button type="button" class="ghost" data-click="replay-exit">Exit replay</button></header>
+    <div class="layout"><div class="theatre"><div class="map-scroll"><div class="board">${replayBoardHtml(frame)}</div></div></div>
+      <aside class="sidebar"><div class="panel"><h3>This moment</h3><p>${esc(frame.text)}</p><p class="quiet">${index + 1} of ${frames.length}</p></div></aside></div>
+    <footer class="tray"><div class="actions">
+      <button type="button" data-click="replay-prev"${index <= 0 ? " disabled" : ""}>Previous</button>
+      <button type="button" class="primary" data-click="replay-next"${index >= frames.length - 1 ? " disabled" : ""}>Next</button>
+      <button type="button" data-click="replay-exit">Exit replay</button>
+    </div></footer></div>`;
+}
+
+function openReplay(returnTo) {
+  menuOpen = false;
+  menuConfirm = null;
+  paused = false;
+  let saved = null;
+  try { saved = readReplay(localStorage); } catch { saved = null; }
+  replayView = { returnTo: returnTo || "setup", frames: saved?.frames || [], index: 0 };
+  render();
+}
+
+function handleReplay(kind) {
+  if (kind === "replay" || kind === "menu-replay") {
+    const back = state?.phase === "end" ? "end" : state ? "live" : "setup";
+    openReplay(back);
+    return;
+  }
+  if (!replayView) return;
+  if (kind === "replay-exit") {
+    replayView = null;
+    render();
+    return;
+  }
+  const last = Math.max(0, (replayView.frames?.length || 1) - 1);
+  if (kind === "replay-prev") replayView.index = Math.max(0, (replayView.index || 0) - 1);
+  if (kind === "replay-next") replayView.index = Math.min(last, (replayView.index || 0) + 1);
+  render();
+}
+
+function showDragNotice(text) {
+  dragNotice = text || "";
+  window.clearTimeout(dragNoticeTimer);
+  dragNoticeTimer = 0;
+  if (!dragNotice) return;
+  dragNoticeTimer = window.setTimeout(() => {
+    dragNotice = "";
+    dragNoticeTimer = 0;
+    if (!pointerDrag) render();
+  }, 2400);
+  render();
+}
+
+function placeGhost(x, y, html) {
+  let ghost = document.querySelector("body > .drag-ghost");
+  if (!ghost) {
+    ghost = document.createElement("div");
+    ghost.className = "drag-ghost";
+    ghost.setAttribute("aria-hidden", "true");
+    document.body.appendChild(ghost);
+  }
+  if (html != null) ghost.innerHTML = html;
+  ghost.style.left = `${x}px`;
+  ghost.style.top = `${y}px`;
+  return ghost;
+}
+
+function removeGhost() {
+  document.querySelector("body > .drag-ghost")?.remove();
+  document.body.classList.remove("dragging");
+}
+
+function snapGhost(x, y, originX, originY) {
+  const ghost = document.querySelector("body > .drag-ghost");
+  document.body.classList.remove("dragging");
+  if (!ghost || reducedMotion()) {
+    ghost?.remove();
+    return;
+  }
+  ghost.classList.add("snap");
+  ghost.style.left = `${x}px`;
+  ghost.style.top = `${y}px`;
+  requestAnimationFrame(() => {
+    ghost.style.left = `${originX}px`;
+    ghost.style.top = `${originY}px`;
+  });
+  window.setTimeout(() => ghost.remove(), 180);
+}
+
+function dragSpec(node) {
+  const el = node?.closest?.("[data-drag]");
+  if (!el || !state || replayView || paused || menuOpen || leaveAsk) return null;
+  const kind = el.dataset.drag;
+  if (kind === "soldier") return { kind, id: el.dataset.id, html: el.innerHTML };
+  if (kind === "dice") return { kind, html: `<span class="drag-label">Bayonets</span>` };
+  if (kind === "hit") return { kind, html: `<span class="drag-label">Hit</span>` };
+  return null;
+}
+
+function dropTargetFrom(node) {
+  if (!node?.closest) return null;
+  const soldier = node.closest(".token[data-id]");
+  const cover = node.closest(".cover[data-id]");
+  const unit = node.closest(".unit[data-id]");
+  const supply = node.closest("[data-drop='supply']");
+  const zoneEl = node.closest(".zone[data-id]");
+  if (soldier) return { type: "soldier", id: soldier.dataset.id, zone: zoneEl?.dataset.id || null };
+  if (cover) return { type: "cover", id: cover.dataset.id, zone: zoneEl?.dataset.id || null };
+  if (unit) return { type: "unit", id: unit.dataset.id, zone: zoneEl?.dataset.id || null };
+  if (supply) return { type: "supply", kind: supply.dataset.kind };
+  if (zoneEl) return { type: "zone", zone: zoneEl.dataset.id };
+  return null;
+}
+
+function deployTargetFor(side, indexes, target) {
+  if (!target) return null;
+  const n = indexes.length;
+  if (target.type === "unit") return { kind: "repair", unitId: target.id };
+  if (target.type === "supply") {
+    if (target.kind === "mortar") return { kind: "mortar" };
+    if (target.kind === "tank") return { kind: "tank" };
+    if (target.kind === "soldier") {
+      const zones = ["obj", ...sideZones(side), ...enemySideZones(side)].filter((zone) => controllerOf(state, zone) === side);
+      if (zones.length === 1) return { kind: "soldier", zone: zones[0] };
+      if (!zones.length) return { kind: "soldier", zone: ownZone1(side) };
+      return { reason: "Drop the bayonet on a zone you control." };
+    }
+    if (target.kind === "mg") {
+      const zones = sideZones(side).filter((zone) => controllerOf(state, zone) === side);
+      if (zones.length === 1) return { kind: "mg", zone: zones[0] };
+      if (!zones.length) return { kind: "mg", zone: sideZones(side)[0] };
+      return { reason: "Drop the bayonets on a zone you control on your side." };
+    }
+    return null;
+  }
+  const zone = target.zone;
+  if (!zone) return null;
+  if (n === 2) return { kind: "mortar", zone };
+  if (n === 3) return { kind: "mg", zone };
+  if (n === 4) {
+    if (zone !== ownZone1(side)) return { reason: "Tanks deploy into your Zone 1." };
+    return { kind: "tank" };
+  }
+  return { kind: "soldier", zone };
+}
+
+function resolveDrag(spec, target) {
+  const side = viewer();
+  if (spec.kind === "soldier") {
+    const drop = trenchMoveDrop(state, side, spec.id, target?.zone || "");
+    if (!drop.action) return { ok: false, reason: drop.reason };
+    return { ok: true, run: () => commit(drop.action) };
+  }
+  if (spec.kind === "dice") {
+    const indexes = selectedBayonetIndexes(side);
+    if (![1, 2, 3, 4].includes(indexes.length) && target?.type !== "supply" && target?.type !== "unit") {
+      return { ok: false, reason: "No deployment costs that many bayonets." };
+    }
+    const mapped = deployTargetFor(side, indexes, target);
+    if (!mapped) return { ok: false, reason: "Drop the bayonets on a soldier, mortar, machine gun, tank, or a damaged weapon." };
+    if (mapped.reason) return { ok: false, reason: mapped.reason };
+    const drop = deployDrop(state, side, indexes, mapped);
+    if (!drop.action) return { ok: false, reason: drop.reason };
+    return { ok: true, run: () => commit(drop.action) };
+  }
+  if (spec.kind === "hit") {
+    const id = target && (target.type === "soldier" || target.type === "cover" || target.type === "unit") ? target.id : "";
+    const drop = hitDrop(state.pending, ui.allocStack, id);
+    if (!drop.stack) return { ok: false, reason: drop.reason };
+    return {
+      ok: true,
+      run: () => {
+        const stacking = (state.pending?.options || []).length > 1;
+        if (!stacking) {
+          armHitFlash({ ids: flashIdsFor(id), cover: Boolean(state.pending?.target?.coverId) });
+          showDragNotice("That is the only target. Confirm to assign every hit.");
+          return;
+        }
+        ui.allocStack = drop.stack;
+        armHitFlash({ ids: flashIdsFor(id), cover: Boolean(state.pending?.target?.coverId) });
+        render();
+      },
+    };
+  }
+  return { ok: false, reason: "That drop is not legal." };
+}
+
+function onPointerDown(event) {
+  if (swallowClick) swallowClick = false;
+  if (event.button != null && event.button !== 0) return;
+  const spec = dragSpec(event.target);
+  if (!spec) return;
+  pointerDrag = {
+    spec,
+    pointerId: event.pointerId,
+    x: event.clientX,
+    y: event.clientY,
+    moved: false,
+    cap: event.target.closest("[data-drag]"),
+  };
+}
+
+function onPointerMove(event) {
+  if (!pointerDrag || event.pointerId !== pointerDrag.pointerId) return;
+  const dx = event.clientX - pointerDrag.x;
+  const dy = event.clientY - pointerDrag.y;
+  if (!pointerDrag.moved) {
+    if (Math.hypot(dx, dy) < 8) return;
+    pointerDrag.moved = true;
+    document.body.classList.add("dragging");
+    try { pointerDrag.cap?.setPointerCapture?.(event.pointerId); } catch { /* The pointer still reports moves. */ }
+    placeGhost(event.clientX, event.clientY, pointerDrag.spec.html);
+  }
+  if (event.cancelable) event.preventDefault();
+  placeGhost(event.clientX, event.clientY);
+}
+
+function onPointerUp(event) {
+  if (!pointerDrag || event.pointerId !== pointerDrag.pointerId) return;
+  const drag = pointerDrag;
+  pointerDrag = null;
+  if (!drag.moved) return;
+  swallowClick = true;
+  const hit = document.elementFromPoint(event.clientX, event.clientY);
+  const decision = resolveDrag(drag.spec, dropTargetFrom(hit));
+  if (!decision.ok) {
+    snapGhost(event.clientX, event.clientY, drag.x, drag.y);
+    showDragNotice(decision.reason);
+    return;
+  }
+  removeGhost();
+  decision.run();
+}
+
+function onPointerCancel(event) {
+  if (!pointerDrag || event.pointerId !== pointerDrag.pointerId) return;
+  const drag = pointerDrag;
+  pointerDrag = null;
+  if (!drag.moved) return;
+  swallowClick = true;
+  snapGhost(event.clientX, event.clientY, drag.x, drag.y);
+}
+
 function scheduleEmptyAdvance() {
   clearEmptyTimer();
   const view = emptyStepView();
-  if (!view?.advance || paused || leaveAsk || missionToast || killToast || menuOpen || ui.help) return;
+  if (!view?.advance || paused || leaveAsk || missionToast || killToast || menuOpen || ui.help || currentTutorialCard()) return;
   if (holdEmpty && holdEmpty.step === state.actionStep && holdEmpty.active === state.active && holdEmpty.round === state.round) return;
   const step = state.actionStep;
   const active = state.active;
@@ -3724,7 +4419,7 @@ function scheduleEmptyAdvance() {
   emptyTimer = window.setTimeout(() => {
     emptyTimer = 0;
     if (!state || state.phase !== "action" || state.actionStep !== step || state.active !== active || state.round !== round) return;
-    if (state.pending?.type !== "action" || !myTurn() || paused || leaveAsk) return;
+    if (state.pending?.type !== "action" || !myTurn() || paused || leaveAsk || currentTutorialCard()) return;
     if (holdEmpty && holdEmpty.step === step && holdEmpty.active === active && holdEmpty.round === round) return;
     if (stepHasLegalAction()) return;
     commit({ type }, { leaving: true });
@@ -3757,9 +4452,18 @@ function render() {
   const board = root.querySelector(".theatre");
   const map = root.querySelector(".map-scroll");
   const side = root.querySelector(".side-scroll");
+  const trayBox = root.querySelector(".tray-scroll");
+  const moreBox = root.querySelector(".actions-more");
   const boardTop = board?.scrollTop || 0;
   const mapLeft = map?.scrollLeft || 0;
   const sideTop = side?.scrollTop || 0;
+  const trayTop = trayBox?.scrollTop || 0;
+  const moreTop = moreBox?.scrollTop || 0;
+  if (replayView) {
+    clearFx();
+    root.innerHTML = `${menuChrome()}${replayHtml()}`;
+    return;
+  }
   if (!state) {
     clearFx();
     root.innerHTML = `${menuChrome()}${coverAsk ? coverPlaceHtml() : splashHtml()}`;
@@ -3775,6 +4479,12 @@ function render() {
   const foeSide = me === "uk" ? "de" : "uk";
   const rounds = Array.from({ length: state.maxRounds }, (_, i) => `<i class="pip-round ${i < state.round ? "on" : ""}"></i>`).join("");
   const conceal = paused;
+  const row = buttonRow(actionList());
+  const back = veilShowing() ? "" : backControl();
+  const notice = dragNotice ? `<div class="error">${esc(dragNotice)}</div>` : "";
+  const error = state.error ? `<div class="error">${esc(state.error)}</div>` : "";
+  const dockBody = `${back}${row.hint}${row.actions}${notice}${error}`;
+  const dock = dockBody.trim() ? `<div class="tray-dock">${dockBody}</div>` : "";
   root.innerHTML = `${menuChrome()}<div class="app"${conceal ? " inert aria-hidden=\"true\"" : ""}>
     <header class="topbar">
       <div class="brand"><h1>Trench Shock</h1><span>${esc(formatName())} · seed ${state.initialSeed}</span></div>
@@ -3787,6 +4497,7 @@ function render() {
       <button type="button" class="ghost" data-click="help">How to play</button>
       <button type="button" class="ghost" data-click="new">New battle</button>
     </header>
+    ${victoryBanner()}
     <div class="layout">
       <div class="theatre"><div class="map-scroll"><div class="board">${TRENCH_LINE.map(renderZone).join("")}</div></div>${supplyLine()}</div>
       <aside class="sidebar">
@@ -3798,20 +4509,21 @@ function render() {
       </aside>
     </div>
     <footer class="tray">
-      ${resultBanner()}
-      ${stepRail()}
-      <div class="who"><h2>${esc(phaseTitle())}</h2><div class="pool">${esc(poolText(me))}</div></div>
-      <div class="prompt${promptFlashClass()}" aria-live="polite">${promptText()}</div>
-      ${lastRoll()}
-      ${roundBanner()}
-      ${state.initiative?.winner ? `<div class="quiet table-label">On the table</div>` : ""}
-      <div class="dice-row"><span class="tag">${labelSide(me)}${state.player1 === me ? " · first" : ""}</span>${state.players[me].dice.map((f, i) => dieButton(me, f, i)).join("")}${diceCombo(me)}</div>
-      <div class="dice-row"><span class="tag">${labelSide(foeSide)}${state.player1 === foeSide ? " · first" : ""}</span>${state.players[foeSide].dice.map((f, i) => dieButton(foeSide, f, i)).join("")}${diceCombo(foeSide)}</div>
-      ${wildControls()}
-      ${extraControls()}
-      ${veilShowing() ? "" : backControl()}
-      ${buttonRow(actionList())}
-      ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}
+      <div class="tray-scroll">
+        ${resultBanner()}
+        ${stepRail()}
+        <div class="who"><h2>${esc(phaseTitle())}</h2><div class="pool">${esc(poolText(me))}</div></div>
+        ${tutorialHtml()}
+        ${lastRoll()}
+        ${state.initiative?.winner ? `<div class="quiet table-label">On the table</div>` : ""}
+        <div class="dice-row"><span class="tag">${labelSide(me)}${state.player1 === me ? " · first" : ""}</span>${state.players[me].dice.map((f, i) => dieButton(me, f, i)).join("")}${diceCombo(me)}</div>
+        <div class="dice-row"><span class="tag">${labelSide(foeSide)}${state.player1 === foeSide ? " · first" : ""}</span>${state.players[foeSide].dice.map((f, i) => dieButton(foeSide, f, i)).join("")}${diceCombo(foeSide)}</div>
+        ${wildControls()}
+        ${extraControls()}
+        <div class="prompt${promptFlashClass()}" aria-live="polite">${promptText()}</div>
+        ${roundBanner()}
+      </div>
+      ${dock}
     </footer>
   </div>
   ${veilHtml()}
@@ -3822,9 +4534,13 @@ function render() {
   const nextBoard = root.querySelector(".theatre");
   const nextMap = root.querySelector(".map-scroll");
   const nextSide = root.querySelector(".side-scroll");
+  const nextTray = root.querySelector(".tray-scroll");
+  const nextMore = root.querySelector(".actions-more");
   if (nextBoard) nextBoard.scrollTop = boardTop;
   if (nextMap) nextMap.scrollLeft = mapLeft;
   if (nextSide) nextSide.scrollTop = sideTop;
+  if (nextTray) nextTray.scrollTop = trayTop;
+  if (nextMore) nextMore.scrollTop = moreTop;
   if (fxLive.length) kickFx();
   scheduleEmptyAdvance();
 }
@@ -3933,7 +4649,10 @@ function splashHtml() {
     ${setup.mode === "hotseat" ? "" : `<div class="field"><p>Difficulty</p><div class="choices">${choice("difficulty", "Easy", "Easy")}${choice("difficulty", "Hard", "Hard")}${choice("difficulty", "Difficult", "Difficult")}</div><p class="note">Headquarters plays this way. Hard is the standard opponent.</p></div>`}
     <div class="field"><p>Undo</p><div class="choices">${choice("undo", "off", "Off")}${choice("undo", "on", "On")}</div><p class="note">On lets you take back the previous action. In pass and play, that closes when the other commander takes the seat.</p></div>
     <button type="button" class="primary" data-click="begin">Begin battle</button>
+    <button type="button" class="ghost ${tutorial.arm ? "on" : ""}" data-click="tutorial" style="margin-left:8px">Tutorial${tutorial.arm ? " on" : ""}</button>
     <button type="button" class="ghost" data-click="help" style="margin-left:8px">How to play</button>
+    ${tutorial.arm ? `<p class="note">The tutorial starts when you begin. Skip and close stay available on each card.</p>` : ""}
+    ${tutorialOfferHtml()}
     ${ui.help ? helpHtml() : ""}
   </div></div>`;
 }
@@ -3950,6 +4669,7 @@ function coverPlaceHtml() {
     <p class="lede">${esc(labelSide(side))}: place your starting cover in ${esc(names[0])}, ${esc(names[1])}, or ${esc(names[2])}.</p>
     <div class="choices">${choices}</div>
     ${hq}
+    ${tutorial.arm ? `<aside class="tutorial-card" role="note" aria-label="Tutorial"><p>${esc(coverTutorialText())}</p><div class="tutorial-actions"><button type="button" data-click="tutorial-skip">Skip</button><button type="button" data-click="tutorial-close" aria-label="Close tutorial">Close</button></div></aside>` : ""}
     <button type="button" class="ghost" data-click="cover-back">Back</button>
     <button type="button" class="ghost" data-click="help" style="margin-left:8px">How to play</button>
     ${ui.help ? helpHtml() : ""}
@@ -3975,6 +4695,11 @@ function launchBattle(coverZones) {
   coverAsk = null;
   resetPresentation();
   coverMemory = null;
+  const teaching = tutorial.arm;
+  tutorial.arm = false;
+  tutorial.live = teaching;
+  tutorial.hidden = null;
+  replayView = null;
   state = startMatch(catalog.events, catalog.missions, {
     format: setup.format,
     human: setup.mode === "hotseat" ? "uk" : setup.human,
@@ -3983,12 +4708,24 @@ function launchBattle(coverZones) {
     coverZones,
   });
   ensureMatchId(state);
+  replayTape = [{
+    kind: "start",
+    text: "The battle begins.",
+    board: boardShot(state),
+    logSize: state.log?.length || 0,
+  }];
   noteBattleOutcome(state);
   tumbleFreshDice(state);
   render();
 }
 
 function onClick(event) {
+  if (swallowClick) {
+    swallowClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
   if (killToast || missionToast) {
     event.preventDefault();
     event.stopPropagation();
@@ -3999,6 +4736,14 @@ function onClick(event) {
   const el = event.target.closest("[data-click]");
   if (!el) return;
   const kind = el.dataset.click;
+  if (kind === "replay" || kind === "menu-replay" || kind === "replay-prev" || kind === "replay-next" || kind === "replay-exit") {
+    handleReplay(kind);
+    return;
+  }
+  if (kind === "tutorial" || kind === "tutorial-start" || kind === "tutorial-skip" || kind === "tutorial-close" || kind === "tutorial-next") {
+    handleTutorial(kind);
+    return;
+  }
   if (handleMenu(kind)) return;
   if (kind === "leave-yes") {
     confirmLeave();
@@ -4043,6 +4788,14 @@ function onClick(event) {
     return;
   }
   if (kind === "begin") {
+    if (!tutorial.arm) {
+      try {
+        if (tutorialStatus(localStorage) === "") rememberTutorial(localStorage, "offered");
+      } catch {
+        /* Beginning the battle does not depend on the tutorial note. */
+      }
+    }
+    tutorialOffer = false;
     coverAsk = { side: setup.mode === "hotseat" ? "uk" : setup.human, uk: null, de: null };
     ui.help = false;
     render();
@@ -4305,6 +5058,15 @@ async function boot() {
     return;
   }
   document.addEventListener("keydown", onMenuKey);
+  document.addEventListener("pointerdown", onPointerDown);
+  document.addEventListener("pointermove", onPointerMove);
+  document.addEventListener("pointerup", onPointerUp);
+  document.addEventListener("pointercancel", onPointerCancel);
+  try {
+    if (tutorialStatus(localStorage) === "") tutorialOffer = true;
+  } catch {
+    tutorialOffer = true;
+  }
   if (new URLSearchParams(location.search).has("sim")) {
     const result = simulateGames(catalog.events, catalog.missions, 20);
     root.innerHTML = `<pre class="sim">${esc(JSON.stringify(result, null, 2))}</pre>`;

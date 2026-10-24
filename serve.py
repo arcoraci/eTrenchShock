@@ -22,6 +22,7 @@ _git_lock = threading.Lock()
 _BRANCH_NAME = re.compile(r"[A-Za-z0-9._/-]+")
 _CACHE_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,80}")
 _FROM_SPEC = re.compile(r"""(\bfrom\s+)(['"])(\.\.?/[^'"]+)\2""")
+_VERSION_RE = re.compile(r"""GAME_VERSION\s*=\s*["']([^"']+)["']""")
 _LOCAL_NEWER = "This copy already has newer local work than GitHub."
 
 
@@ -109,6 +110,40 @@ def cache_token(query):
     return ""
 
 
+def source_token():
+    """A token that changes when the version, page, scripts, or styles change.
+
+    The copy already open in a browser is running an old app.js. That old
+    Update button never asks for a new URL, so a reload of / has to name a
+    module URL the browser has not cached.
+    """
+    version = "0"
+    try:
+        match = _VERSION_RE.search((ROOT / "src" / "version.js").read_text(encoding="utf-8"))
+        if match and match.group(1).strip():
+            version = match.group(1).strip()
+    except OSError:
+        pass
+    latest = 0
+    files = [ROOT / "index.html"]
+    src = ROOT / "src"
+    if src.is_dir():
+        files.extend(
+            path for path in src.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".js", ".css"}
+        )
+    for path in files:
+        try:
+            latest = max(latest, path.stat().st_mtime_ns)
+        except OSError:
+            continue
+    safe_version = re.sub(r"[^A-Za-z0-9._-]", "", version)[:32] or "0"
+    token = f"{safe_version}.{latest}"
+    if _CACHE_TOKEN.fullmatch(token):
+        return token
+    return "0"
+
+
 def bust_imports(text, token):
     """Give each relative module a new URL so a normal browser cache misses."""
 
@@ -121,10 +156,9 @@ def bust_imports(text, token):
     return _FROM_SPEC.sub(repl, text)
 
 
-def index_html(token):
+def index_html(token=""):
     text = (ROOT / "index.html").read_text(encoding="utf-8")
-    if not token:
-        return text
+    token = token or source_token()
     text = text.replace('src="src/ui/app.js"', f'src="src/ui/app.js?v={token}"')
     text = text.replace("src='src/ui/app.js'", f"src='src/ui/app.js?v={token}'")
     text = text.replace('href="src/styles.css"', f'href="src/styles.css?v={token}"')
@@ -494,26 +528,30 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = status()
             self._json(payload)
             return
-        token = cache_token(parsed.query)
+        request_token = cache_token(parsed.query)
         if path in ("/", "/index.html"):
             try:
-                body = index_html(token)
+                # Always stamp from the files on disk. A ?v= already in the
+                # page URL must not be able to keep an older module address.
+                body = index_html(source_token())
             except OSError:
                 self.send_error(404, "Not found")
                 return
-            extra = [("Clear-Site-Data", '"cache"')] if token else None
+            # Update navigates to /?v=... and asks the browser to drop its
+            # HTTP cache. Sending this on every load can reload the page forever.
+            extra = [("Clear-Site-Data", '"cache"')] if request_token else None
             self._send_bytes(body, "text/html; charset=utf-8", extra)
             return
-        if token and path.endswith(".js"):
+        if path.endswith(".js"):
             file = safe_file(path)
             if file is None:
                 self.send_error(404, "Not found")
                 return
+            token = request_token or source_token()
             try:
                 text = bust_imports(file.read_text(encoding="utf-8"), token)
-            except OSError:
-                self.send_error(404, "Not found")
-                return
+            except (OSError, UnicodeError):
+                return SimpleHTTPRequestHandler.do_GET(self)
             self._send_bytes(text, "text/javascript; charset=utf-8")
             return
         return SimpleHTTPRequestHandler.do_GET(self)

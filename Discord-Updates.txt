@@ -1,0 +1,32 @@
+NOT PART OF THE DISCORD POST. Do not paste anything above the dashed line.
+
+How to add the next update: copy the same shape, put the new post above the older one, bump src/version.js, and do not erase older posts.
+
+The pasteable post is the block below. Select from "Trench Shock" through the last bullet.
+
+------------------------------------------------------------
+Trench Shock
+Version 0.9.0
+
+New
+- The end of a battle shows a large flag banner: Britain's flag and "Britain wins", Germany's flag and "Germany wins", or both flags for a draw, with the score. Confirm, Done, and the other step buttons stay at the bottom of the window.
+
+Fixed
+- A mortar round no longer asks you to choose exposed soldiers or soldiers in cover. The shell animation shows the zone, and the hit lands on its own (exposed soldiers when they are there).
+
+------------------------------------------------------------
+Trench Shock
+Version 0.8.0
+
+New
+- Rifle, machine-gun, and tank shots travel across the board to the target.
+- Drag a soldier out of the trench, drag bayonet dice to deploy or repair, and drag hits onto a soldier or cover. The buttons still work.
+- Extra sounds for rifles, machine guns, tanks, gas, and bayonet charges play only when Sound is on.
+- Replay the last finished battle from the Menu, or from the victory screen after the battle ends.
+- A tutorial is on the setup screen and in the Menu. It is offered once, and it can always be skipped.
+- Gas, mortar, most kills, a tank breakthrough, and a completed mission each keep a result line up for 5 seconds. A click clears it early.
+- A mortar shell arcs to its zone, gas spreads as a cloud, an eliminated soldier falls, cracked cover breaks, a tank slides forward, and a bayonet charge dashes in.
+
+Fixed
+- A mortar or shot result no longer darkens the board. The words sit in a small banner, so the shell and the traveling shot stay visible.
+- Update game reloads the current files instead of stopping on a stale page.

@@ -41,6 +41,7 @@ import {
 import { playEvent, discardEvent } from "./events.js";
 import { checkMissions, chooseMission, drawMission, trimMissions } from "./missions.js";
 import { applyHits, allocationOptions, allocationReady, applyAllocatedHits, eliminateSoldier, revealAttackedCover, takeCoverTrophy } from "./combat.js";
+import { fireSources, planDirectShots } from "./shots.js";
 
 const STEPS = ["shock", "tank", "event", "deploy", "move", "cover", "attack"];
 
@@ -896,9 +897,31 @@ function closeDirectFire(state, side, target, hits) {
   if (state.missionExhausted) endGame(state, "Mission Exhaustion");
 }
 
+function describeFire(state, side, attackers, target, result) {
+  const soldiers = attackers.filter((unit) => !unit.type);
+  const guns = attackers.filter((unit) => unit.type === "mg");
+  const tanks = attackers.filter((unit) => unit.type === "tank");
+  let rifle = soldiers.length;
+  if (rifle && state.effects?.cavalryCharge === side) rifle += 1;
+  const mg = guns.reduce((sum) => sum + (target?.zone === "obj" ? 4 : 3), 0);
+  const tank = tanks.length ? 3 : 0;
+  return {
+    sources: fireSources(attackers),
+    faces: (result?.faces || []).slice(),
+    dice: { rifle, mg, tank },
+  };
+}
+
+function releaseDirectShots(state, side, pack, target, picks) {
+  const shots = planDirectShots(state, side, pack.sources, pack.faces, target, picks, pack.dice);
+  for (const shot of shots) pushFx(state, shot);
+}
+
 function settleDirectHits(state, side, target, result, attackers) {
   revealAttackedCover(state, target);
+  const pack = describeFire(state, side, attackers, target, result);
   if (result.hits <= 0 || !isInteractive(state, side)) {
+    releaseDirectShots(state, side, pack, target, null);
     applyHits(state, side, target, result.hits);
     spendAttackers(state, side, attackers);
     closeDirectFire(state, side, target, result.hits);
@@ -906,6 +929,7 @@ function settleDirectHits(state, side, target, result, attackers) {
   }
   const options = allocationOptions(state, side, target);
   if (!options.length) {
+    releaseDirectShots(state, side, pack, target, null);
     applyHits(state, side, target, result.hits);
     spendAttackers(state, side, attackers);
     closeDirectFire(state, side, target, result.hits);
@@ -925,6 +949,9 @@ function settleDirectHits(state, side, target, result, attackers) {
       unitId: target.unitId || null,
     },
     options,
+    sources: pack.sources,
+    faces: pack.faces,
+    dice: pack.dice,
   };
 }
 
@@ -932,15 +959,26 @@ function allocateHits(state, action) {
   const pending = state.pending;
   if (pending?.type !== "allocate-hits") throw new Error("No hits are waiting.");
   const side = pending.side;
+  const picks = Array.isArray(action.picks) ? action.picks.slice() : [];
+  const shots = planDirectShots(
+    state,
+    side,
+    pending.sources || [],
+    pending.faces || [],
+    pending.target,
+    action.auto ? null : picks,
+    pending.dice || null,
+  );
   if (action.auto) {
     if (isInteractive(state, side)) throw new Error("Assign the hits.");
     applyHits(state, side, pending.target, pending.hits);
+    for (const shot of shots) pushFx(state, shot);
     closeDirectFire(state, side, pending.target, pending.hits);
     return;
   }
-  const picks = Array.isArray(action.picks) ? action.picks.slice() : [];
   if (!allocationReady(pending, picks)) throw new Error("Assign every hit.");
   applyAllocatedHits(state, side, pending.target, picks, pending.hits);
+  for (const shot of shots) pushFx(state, shot);
   closeDirectFire(state, side, pending.target, pending.hits);
 }
 
@@ -1019,12 +1057,8 @@ function offerMortarHit(state, unit, zone) {
     markMortarFired(state, unit, 0);
     return;
   }
-  if (!isInteractive(state, side) || options.length === 1) {
-    const pick = options.find((o) => o.kind === "exposed") || options[0];
-    applyMortarHit(state, unit, pick);
-    return;
-  }
-  state.pending = { type: "mortar-target", side, unitId: unit.id, zone, options };
+  const pick = options.find((o) => o.kind === "exposed") || options[0];
+  applyMortarHit(state, unit, pick);
 }
 
 function allocateMortar(state, action) {

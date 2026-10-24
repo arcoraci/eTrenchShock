@@ -62,6 +62,15 @@ export function runUntilHuman(state) {
   let guard = 0;
   while (state && state.phase !== "end" && guard < 160) {
     guard += 1;
+    if (state.pending?.type === "mortar-target") {
+      const options = state.pending.options || [];
+      const pick = options.find((option) => option.kind === "exposed") || options[0];
+      if (!pick) break;
+      const landed = apply(state, { type: "ALLOCATE_MORTAR", targetId: pick.id });
+      if (landed.error) break;
+      state = landed;
+      continue;
+    }
     if (state.phase === "initiative" && state.pending?.type === "roll1") {
       state = apply(state, { type: "ROLL_1" });
       continue;
