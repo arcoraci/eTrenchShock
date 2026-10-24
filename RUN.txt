@@ -50,7 +50,7 @@ Open the game
 Who you play
   On the first screen, set Opposition.
   Pass and play is for two people on one computer. The screen then says
-  The table: Britain's trench is on the left, Germany's is on the right,
+  The table: Germany's trench is on the left, Britain's is on the right,
   and you pass the seat when asked. Press Begin battle. When the game says
   "Pass the seat. The next commander is" Britain or Germany, hand the
   computer over and press "I am Britain" or "I am Germany".
@@ -99,3 +99,16 @@ Upload to Google Drive
   Open that link. If you are not signed in to the Google account that has
   access, sign in first.
   Click New, then File upload, and choose the renamed spreadsheet.
+
+Minified player copy
+  The readable game stays in src/. This builds a separate minified copy
+  for players and does not change src/:
+
+      node tools/build-player.mjs
+
+  That writes the player folder (one bundled script, one minified stylesheet,
+  and the assets the game requests). On Windows, double-click player\\start.bat.
+  On Mac or Linux, open a terminal in the player folder and run python3 serve.py.
+  Then open http://127.0.0.1:8081
+  The project serve.py only serves this folder, on port 8080. The player copy
+  uses its own serve.py on 8081 so the two can stay up together.

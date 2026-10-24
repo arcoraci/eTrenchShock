@@ -66,7 +66,19 @@ const STEPS = [
 
 const FACES = ["boot", "whistle", "wild", "shovel", "bayonet"];
 const FACE_LABEL = { boot: "Boot", whistle: "Whistle", wild: "Wild", shovel: "Shovel", bayonet: "Bayonet" };
-const TRENCH_LINE = ["ukTrench", "uk1", "uk2", "uk3", "obj", "de3", "de2", "de1", "deTrench"];
+const TRENCH_LINE = ["deTrench", "de1", "de2", "de3", "obj", "uk3", "uk2", "uk1", "ukTrench"];
+const BOARD_PX = [0, 174, 250, 330, 407, 614, 690, 771, 847, 1024];
+const ZONE_SHORT = {
+  ukTrench: "Trench",
+  uk1: "Zone 1",
+  uk2: "Zone 2",
+  uk3: "Zone 3",
+  obj: "Objective",
+  de3: "Zone 3",
+  de2: "Zone 2",
+  de1: "Zone 1",
+  deTrench: "Trench",
+};
 const ATTACK_ICON = { hit: "assets/die-hit.png", miss: "assets/die-miss.png" };
 const MORTAR_ICON = { z1: "assets/die-zone1.png", z2: "assets/die-zone2.png", z3: "assets/die-zone3.png" };
 
@@ -412,7 +424,7 @@ function fxSpan(beat) {
     const n = Math.max(1, (beat.zones || []).length);
     return Math.min(1300, 780 + (n - 1) * 160);
   }
-  if (beat.kind === "elim") return 520;
+  if (beat.kind === "elim") return 760;
   if (beat.kind === "cover") return 560;
   if (beat.kind === "charge") return 500;
   if (beat.kind === "shot") return 820;
@@ -595,6 +607,9 @@ function syncHidden(now) {
         document.querySelector(`.token[data-id="${id}"]`)?.classList.add("fx-hidden");
       }
     }
+    if (beat.kind === "elim" && beat.soldierId) {
+      document.querySelector(`.casualty-token[data-soldier="${beat.soldierId}"]`)?.classList.add("fx-hidden");
+    }
   }
 }
 
@@ -713,15 +728,32 @@ function drawGas(ctx, beat, u) {
   });
 }
 
+function casualtyBox(owner) {
+  const el = document.querySelector(`.casualty-slot[data-side="${owner}"] .slot-pieces`)
+    || document.querySelector(`.casualty-slot[data-side="${owner}"]`);
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) return null;
+  return { cx: rect.left + rect.width / 2, cy: rect.top + rect.height / 2 };
+}
+
 function drawElim(layer, beat, u) {
-  const box = zoneBox(beat.zone);
-  if (!box) return;
+  const from = zoneBox(beat.zone);
+  const to = casualtyBox(beat.owner);
+  if (!from && !to) return;
+  const start = from || to;
+  const end = to || start;
   const el = fxGhost(layer, `elim-${beat.id}`, "fx-soldier");
   portrait(el, soldierSrc(beat.owner));
-  const tilt = (beat.owner === "de" ? 1 : -1) * u * 18;
-  el.style.left = `${box.cx - 23}px`;
-  el.style.top = `${box.cy - 28 + u * 40}px`;
-  el.style.opacity = String(1 - u * 0.95);
+  const ease = u * u * (3 - 2 * u);
+  const x = start.cx + (end.cx - start.cx) * ease;
+  const y = start.cy + (end.cy - start.cy) * ease - Math.sin(Math.PI * ease) * 20;
+  const tilt = (beat.owner === "de" ? 1 : -1) * ease * 16;
+  el.style.width = "30px";
+  el.style.height = "30px";
+  el.style.left = `${x - 15}px`;
+  el.style.top = `${y - 15}px`;
+  el.style.opacity = String(ease > 0.9 ? 1 - (ease - 0.9) / 0.1 : 1);
   el.style.transform = `rotate(${tilt}deg)`;
 }
 
@@ -1936,6 +1968,34 @@ function zoneHold(id) {
   return `<div class="zone-hold ${cls}"><i class="flag" aria-hidden="true"></i><span>${esc(name)}</span>${vp}</div>`;
 }
 
+function columnStyle(id) {
+  const index = TRENCH_LINE.indexOf(id);
+  const left = Number(((BOARD_PX[index] / 1024) * 100).toFixed(2));
+  const right = Number(((BOARD_PX[index + 1] / 1024) * 100).toFixed(2));
+  return `left:${left.toFixed(2)}%;width:${(right - left).toFixed(2)}%`;
+}
+
+function casualtyTokens(side) {
+  return state.soldiers
+    .filter((soldier) => soldier.owner === side && soldier.loc === "casualties")
+    .map((soldier) => {
+      const title = `${labelSide(soldier.owner)} soldier, eliminated`;
+      return `<span class="token casualty-token ${soldier.owner}" data-soldier="${esc(soldier.id)}" title="${esc(title)}" aria-label="${esc(title)}">${helmet(soldier.owner)}</span>`;
+    })
+    .join("");
+}
+
+function trenchSlots(side) {
+  const reserveCount = countAt(side, "available");
+  const portrait = side === "de" ? "assets/soldier-german.png" : "assets/soldier-british.png";
+  const face = reserveCount ? `<img src="${portrait}" alt="" draggable="false">` : "";
+  const locked = `<div class="wall-slot locked" aria-hidden="true"></div>`;
+  const casualties = `<div class="wall-slot casualties casualty-slot" data-side="${side}" data-click="slot" aria-label="${esc(labelSide(side))} casualties"><span class="slot-label">Casualties</span><div class="slot-pieces">${casualtyTokens(side)}</div></div>`;
+  const reserve = `<div class="wall-slot reinforcements" data-click="slot" aria-label="${esc(labelSide(side))} reserve, ${reserveCount}"><span class="slot-label">Reserve</span><b>${reserveCount}</b>${face}</div>`;
+  const bands = side === "de" ? [locked, casualties, reserve] : [reserve, casualties, locked];
+  return bands.map((html, index) => html.replace('class="wall-slot', `class="wall-slot band-${["top", "mid", "bot"][index]}`)).join("");
+}
+
 function renderZone(id) {
   const ukAll = state.soldiers.filter((s) => s.loc === id && s.owner === "uk");
   const deAll = state.soldiers.filter((s) => s.loc === id && s.owner === "de");
@@ -1944,24 +2004,27 @@ function renderZone(id) {
   const covers = coversIn(state, id);
   const gear = state.equipment.filter((u) => u.loc === id);
   const ground = id === "obj" ? "obj" : id.startsWith("uk") ? "uk-ground" : id.startsWith("de") ? "de-ground" : "";
-  const nation = id.startsWith("uk") ? `<span class="nation uk">Britain</span>` : id.startsWith("de") ? `<span class="nation de">Germany</span>` : `<span class="nation">Both sides</span>`;
-  const classes = ["zone", ground, id.includes("Trench") ? "trench" : "", ui.zone === id ? "picked" : "", legalZones().includes(id) ? "legal" : "", state.effects.smoke.includes(id) ? "smoke" : ""];
-  let ctrl = "";
-  if (isBattlefield(id)) {
-    if (isContested(state, id)) ctrl = "<em>Contested</em>tank on the field";
-    else if (controllerOf(state, id)) ctrl = `<em>${labelSide(controllerOf(state, id))}</em>control`;
-    else ctrl = "<em>Open</em>no control";
-  } else {
-    const side = id.startsWith("uk") ? "uk" : "de";
-    ctrl = `<em>${countAt(side, id)} / 5</em>in the trench`;
-  }
-  const smoke = state.effects.smoke.includes(id) ? `<span class="zone-meta">Smoke screen</span>` : "";
-  const counts = ukAll.length || deAll.length ? `${ukAll.length} British · ${deAll.length} German` : "Empty";
-  return `<div class="${classes.filter(Boolean).join(" ")}" data-click="zone" data-id="${id}">
-    <div class="zone-name">${zoneHold(id)}${nation}<strong>${esc(ZONE_LABELS[id])}</strong>${counts}${smoke}</div>
-    <div class="zone-body">${uk.map((s) => soldierButton(s)).join("")}${covers.map(coverButton).join("")}${gear.map(unitButton).join("")}${de.map((s) => soldierButton(s)).join("")}</div>
-    <div class="zone-ctrl">${ctrl}</div>
+  const trench = id === "ukTrench" || id === "deTrench";
+  const classes = ["zone", ground, trench ? "trench" : "", ui.zone === id ? "picked" : "", legalZones().includes(id) ? "legal" : "", state.effects.smoke.includes(id) ? "smoke" : ""];
+  const smoke = state.effects.smoke.includes(id) ? `<span class="zone-meta">Smoke</span>` : "";
+  const trenchCount = trench ? `<span class="zone-meta">${countAt(id.startsWith("de") ? "de" : "uk", id)} / 5</span>` : "";
+  const pieces = `${uk.map((s) => soldierButton(s)).join("")}${covers.map(coverButton).join("")}${gear.map(unitButton).join("")}${de.map((s) => soldierButton(s)).join("")}`;
+  const slots = trench ? trenchSlots(id.startsWith("de") ? "de" : "uk") : "";
+  const bodyClass = trench ? "trench-body" : "zone-column";
+  const title = trench
+    ? `${zoneHold(id)}${trenchCount}`
+    : `${zoneHold(id)}<strong>${esc(ZONE_SHORT[id] || ZONE_LABELS[id])}</strong>${smoke}`;
+  return `<div class="${classes.filter(Boolean).join(" ")}" style="${columnStyle(id)}" data-click="zone" data-id="${id}" aria-label="${esc(ZONE_LABELS[id])}">
+    ${slots}
+    <div class="${bodyClass}">
+      <div class="zone-name">${title}</div>
+      <div class="zone-body">${pieces}</div>
+    </div>
   </div>`;
+}
+
+function boardHtml() {
+  return `<div class="board"><img class="board-art" src="assets/game-board.jpg" alt="">${TRENCH_LINE.map(renderZone).join("")}</div>`;
 }
 
 function actionFlag(owner, id) {
@@ -4147,7 +4210,7 @@ function replayBoardHtml(frame) {
   const savedZone = ui.zone;
   ui.zone = null;
   try {
-    return withView(replayGame(frame), () => TRENCH_LINE.map(renderZone).join(""));
+    return withView(replayGame(frame), () => boardHtml());
   } finally {
     ui.zone = savedZone;
   }
@@ -4166,7 +4229,7 @@ function replayHtml() {
   return `<div class="app replay-app">
     <header class="topbar"><div class="brand"><h1>Replay</h1><span>Round ${esc(board.round || 1)} · ${esc(score)}</span></div>
       <button type="button" class="ghost" data-click="replay-exit">Exit replay</button></header>
-    <div class="layout"><div class="theatre"><div class="map-scroll"><div class="board">${replayBoardHtml(frame)}</div></div></div>
+    <div class="layout"><div class="theatre"><div class="map-scroll">${replayBoardHtml(frame)}</div></div>
       <aside class="sidebar"><div class="panel"><h3>This moment</h3><p>${esc(frame.text)}</p><p class="quiet">${index + 1} of ${frames.length}</p></div></aside></div>
     <footer class="tray"><div class="actions">
       <button type="button" data-click="replay-prev"${index <= 0 ? " disabled" : ""}>Previous</button>
@@ -4499,7 +4562,7 @@ function render() {
     </header>
     ${victoryBanner()}
     <div class="layout">
-      <div class="theatre"><div class="map-scroll"><div class="board">${TRENCH_LINE.map(renderZone).join("")}</div></div>${supplyLine()}</div>
+      <div class="theatre"><div class="map-scroll">${boardHtml()}</div>${supplyLine()}</div>
       <aside class="sidebar">
         ${roundLogHtml()}
         <div class="tabs">
@@ -4601,7 +4664,7 @@ function helpHtml() {
   if (!ui.help) return "";
   return `<div class="modal"><div class="modal-card"><div class="rules">
     <h2>How to play</h2>
-    <p>Two armies fight for the Objective Zone. Britain is on the left and advances to the right. Germany is on the right and advances to the left. A tank in a zone contests it, so nobody controls that ground.</p>
+    <p>Two armies fight for the Objective Zone. Germany is on the left and advances to the right. Britain is on the right and advances to the left. A tank in a zone contests it, so nobody controls that ground.</p>
     <h3>The round</h3>
     <ul>
       <li>Both sides roll five action dice. That opening roll sets initiative. Wilds are ignored: they do not make a pair, a full house, or five of a kind. Five of a kind beats four, then a full house, three of a kind, two pair, one pair, then the highest face: Bayonet, Whistle, Shovel, Boot. If that comparison ties, both sides roll all five again and the tied roll is discarded. The roll-off does not use Roll 2 or Roll 3.</li>
@@ -4637,7 +4700,7 @@ function helpHtml() {
 
 function splashHtml() {
   const choice = (key, value, label) => `<button type="button" class="choice ${setup[key] === value ? "on" : ""}" data-click="setup" data-key="${key}" data-value="${value}">${label}</button>`;
-  const sideChoices = setup.mode === "hotseat" ? `<p class="quiet">Britain's trench is on the left. Germany's is on the right. Pass the seat when asked.</p>` : `<div class="choices">${choice("human", "uk", "Britain")}${choice("human", "de", "Germany")}</div>`;
+  const sideChoices = setup.mode === "hotseat" ? `<p class="quiet">Germany's trench is on the left. Britain's is on the right. Pass the seat when asked.</p>` : `<div class="choices">${choice("human", "uk", "Britain")}${choice("human", "de", "Germany")}</div>`;
   return `<div class="splash"><div class="splash-card">
     <div class="portraits"><div class="badge uk">${helmet("uk")}</div><div class="badge de">${helmet("de")}</div></div>
     <h1>Trench Shock</h1>
@@ -4736,6 +4799,7 @@ function onClick(event) {
   const el = event.target.closest("[data-click]");
   if (!el) return;
   const kind = el.dataset.click;
+  if (kind === "slot") return;
   if (kind === "replay" || kind === "menu-replay" || kind === "replay-prev" || kind === "replay-next" || kind === "replay-exit") {
     handleReplay(kind);
     return;

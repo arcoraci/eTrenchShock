@@ -45,7 +45,7 @@ Do not double-click index.html. The game only works from that address.
 Who you play
 On the first screen, set Opposition.
 
-Pass and play is two people on one computer. Britain's trench is on the left, Germany's is on the right. Press Begin battle. When it says "Pass the seat," hand the computer over and press "I am Britain" or "I am Germany".
+Pass and play is two people on one computer. Germany's trench is on the left, Britain's is on the right. Press Begin battle. When it says "Pass the seat," hand the computer over and press "I am Britain" or "I am Germany".
 
 Headquarters is one person. Choose Britain or Germany, set Difficulty to Easy, Hard, or Difficult, then press Begin battle. Hard is the standard opponent. Pass and play does not ask.
 

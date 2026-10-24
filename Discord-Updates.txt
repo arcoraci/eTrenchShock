@@ -6,6 +6,14 @@ The pasteable post is the block below. Select from "Trench Shock" through the la
 
 ------------------------------------------------------------
 Trench Shock
+Version 0.10.0
+
+New
+- The battlefield is the painted trench board. Germany is on the left, Britain is on the right, and the Objective is the crater field in the center.
+- Soldiers eliminated this round appear in that side's casualty slot, the painted Fortify box. The end of the round returns them to Reinforcements.
+
+------------------------------------------------------------
+Trench Shock
 Version 0.9.0
 
 New
